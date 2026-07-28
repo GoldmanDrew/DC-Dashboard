@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.*
+!.env.example

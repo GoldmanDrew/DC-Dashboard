@@ -1,0 +1,1104 @@
+/* global globalThis, module */
+(function initPairBacktest(globalObj) {
+  const MAX_CONTIGUOUS_METRICS_GAP_DAYS = 45;
+  const HARD_LIFECYCLE_GAP_DAYS = 365;
+
+  function toNum(v) {
+    if (typeof v === "number") return Number.isFinite(v) ? v : NaN;
+    if (typeof v === "string") {
+      const s = v.trim();
+      if (!s) return NaN;
+      const n = Number(s.replace(/,/g, ""));
+      return Number.isFinite(n) ? n : NaN;
+    }
+    return NaN;
+  }
+
+  function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function dateGapDays(a, b) {
+    const ta = Date.parse(`${String(a || "").slice(0, 10)}T00:00:00Z`);
+    const tb = Date.parse(`${String(b || "").slice(0, 10)}T00:00:00Z`);
+    if (!Number.isFinite(ta) || !Number.isFinite(tb)) return NaN;
+    return Math.round((tb - ta) / 86400000);
+  }
+
+  function keepLatestContiguousPoints(points, maxGapDays = MAX_CONTIGUOUS_METRICS_GAP_DAYS) {
+    const pts = (Array.isArray(points) ? points : [])
+      .filter((p) => String(p && p.date || "").slice(0, 10))
+      .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")));
+    let startIdx = 0;
+    for (let i = 1; i < pts.length; i += 1) {
+      const gap = dateGapDays(pts[i - 1].date, pts[i].date);
+      const prevSrc = String(pts[i - 1].sourceKey || "").trim().toLowerCase();
+      const curSrc = String(pts[i].sourceKey || "").trim().toLowerCase();
+      const sourceChanged = Boolean(prevSrc || curSrc) && prevSrc !== curSrc;
+      if (
+        Number.isFinite(gap)
+        && (gap > HARD_LIFECYCLE_GAP_DAYS || (gap > maxGapDays && sourceChanged))
+      ) startIdx = i;
+    }
+    return pts.slice(startIdx);
+  }
+
+  function dailyBorrowRate(v) {
+    const n = toNum(v);
+    return Number.isFinite(n) ? Math.max(0, n) / 252 : 0;
+  }
+
+  /**
+   * Annual borrow **cost** drag per $1 ETF short MV (fee-only).
+   * Production `borrow_current` / IBKR fee_annual: positive magnitude.
+   * Legacy/tests short_favorable_positive fee: negative rate.
+   */
+  function annualBorrowCostDragPerShortDollar(canon) {
+    const n = toNum(canon);
+    if (!Number.isFinite(n)) return 0;
+    if (n < 0) return -n;
+    return Math.max(0, n);
+  }
+
+  function decodeRouteSymbol(raw) {
+    const s = String(raw || "").trim();
+    if (!s) return "";
+    try {
+      return decodeURIComponent(s).toUpperCase();
+    } catch (_) {
+      return s.toUpperCase();
+    }
+  }
+
+  function parseShortFlowBacktestRoute(hash) {
+    const h = String(hash || "").trim();
+    const globalMatch = /^#\/backtest-flow(?:\/([^/?#]+))?$/i.exec(h);
+    if (globalMatch) {
+      return {
+        matches: true,
+        page: "backtest-flow",
+        preloadSymbol: decodeRouteSymbol(globalMatch[1]),
+        compatibility: false,
+      };
+    }
+    const chartCompat = /^#\/chart\/([^/?#]+)\/backtest-flow$/i.exec(h);
+    if (chartCompat) {
+      return {
+        matches: true,
+        page: "backtest-flow",
+        preloadSymbol: decodeRouteSymbol(chartCompat[1]),
+        compatibility: true,
+      };
+    }
+    return { matches: false, page: "", preloadSymbol: "", compatibility: false };
+  }
+
+  function normalizeSeries(rows, opts) {
+    const valueKey = (opts && opts.valueKey) || "total_return";
+    const priceKey = (opts && opts.priceKey) || "close_price";
+    if (!Array.isArray(rows)) return [];
+    return rows
+      .map((r) => {
+        const value = toNum(r && (r[valueKey] ?? r.nav_total_return));
+        const px = toNum(r && r[priceKey]);
+        const fallback = Number.isFinite(value) && value > 0 ? value : px;
+        const close = Number.isFinite(px) && px > 0 ? px : fallback;
+        return {
+          date: String((r && r.date) || ""),
+          value: fallback,
+          close,
+          sharesTraded: toNum(r && (r.shares_traded ?? r.volume ?? r.daily_volume)),
+          aum: toNum(r && r.aum),
+          sharesOutstanding: toNum(r && r.shares_outstanding),
+        };
+      })
+      .filter((r) => r.date && Number.isFinite(r.value) && r.value > 0 && Number.isFinite(r.close) && r.close > 0)
+      .sort((a, b) => a.date.localeCompare(b.date));
+  }
+
+  function borrowMapFromRows(rows) {
+    const out = {};
+    if (!Array.isArray(rows)) return out;
+    rows.forEach((r) => {
+      const d = String((r && r.date) || "");
+      const b = toNum(r && (r.borrow_current ?? r.borrow_fee_annual ?? r.borrow_net_annual));
+      if (d && Number.isFinite(b)) out[d] = b;
+    });
+    return out;
+  }
+
+  function median(arr) {
+    const vals = (arr || []).map(toNum).filter((v) => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
+    if (!vals.length) return NaN;
+    const mid = Math.floor(vals.length / 2);
+    return vals.length % 2 ? vals[mid] : 0.5 * (vals[mid - 1] + vals[mid]);
+  }
+
+  /** Sum distribution amounts by ex-date (ISO YYYY-MM-DD). */
+  function buildDistributionByDate(distributions) {
+    const out = Object.create(null);
+    if (!Array.isArray(distributions)) return out;
+    for (const item of distributions) {
+      const ex = String((item && item.ex_date) || "").trim();
+      const amt = toNum(item && item.amount);
+      if (ex && Number.isFinite(amt) && amt > 0) out[ex] = (out[ex] || 0) + amt;
+    }
+    return out;
+  }
+
+  function normalizeSplitEventList(events) {
+    return (Array.isArray(events) ? events : [])
+      .map((ev) => {
+        const date = String((ev && ev.date) || "").trim().slice(0, 10);
+        const mult = toNum(ev && ev.mult);
+        return date && mult > 0 ? { date, mult } : null;
+      })
+      .filter(Boolean);
+  }
+
+  function splitEventWindowDays(a, b) {
+    const da = new Date(`${a}T00:00:00Z`);
+    const db = new Date(`${b}T00:00:00Z`);
+    if (Number.isNaN(da.getTime()) || Number.isNaN(db.getTime())) return Infinity;
+    return Math.abs((db - da) / 86400000);
+  }
+
+  /**
+   * Return the declared share-factor (rf/rt) to divide quantity by when a close
+   * jump is a corp split — including market-obscured days where observed jump
+   * is declared×economic (e.g. NBIZ 6.85× on a 10× reverse split).
+   */
+  function resolveDeclaredSplitShareFactor(events, rowDate, jump, windowDays = 7) {
+    if (!(jump > 0) || !Number.isFinite(jump)) return null;
+    const PB = globalObj.PriceBasis;
+    let best = null;
+    for (const ev of events) {
+      const m = Number(ev && ev.mult);
+      if (!(m > 0)) continue;
+      if (splitEventWindowDays(ev.date, rowDate) > windowDays) continue;
+      const absJump = jump >= 1 ? jump : 1 / jump;
+      const absMult = m >= 1 ? m : 1 / m;
+      let exact = false;
+      if (PB && typeof PB.matchSplitToPriceJump === "function") {
+        const matched = PB.matchSplitToPriceJump(absJump, absMult);
+        exact = matched != null && Math.abs(absJump / absMult - 1) <= 0.18;
+      } else {
+        exact = Math.abs(absJump / absMult - 1) <= 0.18;
+      }
+      const obscured = PB && typeof PB.isPlausiblePostSplitResidual === "function"
+        ? PB.isPlausiblePostSplitResidual(jump, m)
+        : false;
+      if (!exact && !obscured) continue;
+      const dist = splitEventWindowDays(ev.date, rowDate);
+      if (!best || dist < best.dist || (dist === best.dist && exact && !best.exact)) {
+        best = { m, dist, exact };
+      }
+    }
+    return best ? best.m : null;
+  }
+
+  function matchDeclaredSplitJump(events, rowDate, jump, windowDays = 7) {
+    const factor = resolveDeclaredSplitShareFactor(events, rowDate, jump, windowDays);
+    return factor != null ? jump : null;
+  }
+
+  /**
+   * Scale carried share quantities when raw tradeable prices jump on a split.
+   * PnL uses split-aware TR prices; exposure/borrow must not multiply stale qty by post-split close.
+   * A split-like vendor bar without a matching declared action is deliberately
+   * ignored: treating familiar 2x/3x/6x glitches as corporate actions creates
+   * permanent share-count and P&L errors.
+   *
+   * When the observed jump is declared×economic (market-obscured), scale by the
+   * declared factor — not the raw jump — so residual economics stay in MV.
+   */
+  function applyCrossSplitQuantityAdjust(qE, qU, prev, cur, etfEvents, undEvents) {
+    let nextE = qE;
+    let nextU = qU;
+    if (prev && cur && prev.pl > 0 && cur.pl > 0) {
+      const etfJump = cur.pl / prev.pl;
+      const etfFactor = resolveDeclaredSplitShareFactor(etfEvents, cur.date, etfJump);
+      if (etfFactor) nextE = qE / etfFactor;
+    }
+    if (prev && cur && prev.ps > 0 && cur.ps > 0) {
+      const undJump = cur.ps / prev.ps;
+      const undFactor = resolveDeclaredSplitShareFactor(undEvents, cur.date, undJump);
+      if (undFactor) nextU = qU / undFactor;
+    }
+    return { qE: nextE, qU: nextU };
+  }
+
+  function underlyingPxForPoint(pt) {
+    if (!pt) return NaN;
+    const trUnd = toNum(pt.trUndPx);
+    if (trUnd > 0) return trUnd;
+    return toNum(pt.ps);
+  }
+
+  /**
+   * Short ETF daily PnL on one leg.
+   * Primary: -MV × (TR_t/TR_{t-1} - 1) on split-aware TR prices when available.
+   * Else Yahoo adj close (dividends embedded). Fallback: raw close + explicit div — never both.
+   */
+  function computeEtfShortDayPnl(qE, prev, cur, distByDate) {
+    const prevMv = qE * prev.pl;
+    const prevTr = prev.trPx;
+    const curTr = cur.trPx;
+    if (Number.isFinite(prevTr) && prevTr > 0 && Number.isFinite(curTr) && curTr > 0) {
+      const trRet = curTr / prevTr - 1;
+      return { pnl: -prevMv * trRet, divDebit: 0, mode: cur.trMode || "tr_price" };
+    }
+    const prevAdj = prev.pa;
+    const curAdj = cur.pa;
+    if (Number.isFinite(prevAdj) && prevAdj > 0 && Number.isFinite(curAdj) && curAdj > 0) {
+      const trRet = curAdj / prevAdj - 1;
+      return { pnl: -prevMv * trRet, divDebit: 0, mode: "adj_close" };
+    }
+    let pnl = -qE * (cur.pl - prev.pl);
+    let divDebit = 0;
+    const divAmt = distByDate[cur.date];
+    if (Number.isFinite(divAmt) && divAmt > 0) {
+      divDebit = qE * divAmt;
+      pnl -= divDebit;
+    }
+    return {
+      pnl,
+      divDebit,
+      mode: divDebit > 0 ? "price_plus_div" : "price_only",
+    };
+  }
+
+  function alignPair(longRows, shortRows, opts) {
+    const l = normalizeSeries(longRows, opts && opts.long);
+    const s = normalizeSeries(shortRows, opts && opts.short);
+    const sm = new Map(s.map((r) => [r.date, r]));
+    const out = [];
+    l.forEach((lr) => {
+      const sr = sm.get(lr.date);
+      if (sr) out.push({ date: lr.date, long: lr, short: sr });
+    });
+    return out.sort((a, b) => a.date.localeCompare(b.date));
+  }
+
+  function interpolateBorrow(date, bmap, fallback) {
+    if (bmap && Object.prototype.hasOwnProperty.call(bmap, date)) return dailyBorrowRate(bmap[date]);
+    return dailyBorrowRate(fallback);
+  }
+
+  function slippageCost(tradeNotional, refNotional, params) {
+    const notional = Math.abs(toNum(tradeNotional));
+    if (!Number.isFinite(notional) || notional <= 0) return 0;
+    const floorBps = Math.max(0, toNum(params && params.floorBps) || 0);
+    const impactBps = Math.max(0, toNum(params && params.impactBps) || 0);
+    const capBps = Math.max(floorBps, toNum(params && params.capBps) || 100);
+    const ref = Math.max(1, toNum(refNotional) || 0);
+    const participation = notional / ref;
+    const bps = Math.min(capBps, floorBps + impactBps * Math.sqrt(Math.max(0, participation)));
+    return notional * (bps / 10000);
+  }
+
+  function exposureRatio(longMv, shortMvAbs) {
+    const gross = Math.abs(longMv) + Math.abs(shortMvAbs);
+    if (!Number.isFinite(gross) || gross <= 0) return 0;
+    return Math.abs(longMv - shortMvAbs) / gross;
+  }
+
+  function rebalanceToDrift(longMv, shortMvAbs, hedgeToRatio) {
+    const gross = Math.abs(longMv) + Math.abs(shortMvAbs);
+    const targetRatio = clamp(toNum(hedgeToRatio) || 0, 0, 0.95);
+    const direction = longMv >= shortMvAbs ? 1 : -1;
+    const targetNet = direction * targetRatio * gross;
+    return {
+      targetLong: (gross + targetNet) / 2,
+      targetShortAbs: (gross - targetNet) / 2,
+    };
+  }
+
+  function runPairBacktest(params) {
+    const aligned = alignPair(params && params.longRows, params && params.shortRows, params);
+    if (aligned.length < 2) return { ok: false, error: "Need at least two overlapping close dates." };
+
+    const initialGross = Math.max(1000, toNum(params && params.initialGross) || 100000);
+    const rebalanceEvery = Math.max(1, Math.round(toNum(params && params.rebalanceEveryDays) || 5));
+    const driftThreshold = clamp((toNum(params && params.driftThresholdPct) || 5) / 100, 0, 0.95);
+    const hedgeToRatio = clamp((toNum(params && params.hedgeToPct) || 1) / 100, 0, 0.95);
+    const costParams = {
+      floorBps: toNum(params && params.floorBps),
+      impactBps: toNum(params && params.impactBps),
+      capBps: toNum(params && params.capBps),
+    };
+    const fallbackBorrowAnnual = toNum(params && params.fallbackBorrowAnnual);
+    const borrowByDate = borrowMapFromRows(params && params.shortBorrowRows);
+
+    const longMedianShares = median(aligned.map((p) => p.long.sharesTraded));
+    const shortMedianShares = median(aligned.map((p) => p.short.sharesTraded));
+    const longMedianDollarVol = Number.isFinite(longMedianShares) ? longMedianShares * aligned[0].long.close : NaN;
+    const shortMedianDollarVol = Number.isFinite(shortMedianShares) ? shortMedianShares * aligned[0].short.close : NaN;
+
+    let longQty = (initialGross / 2) / aligned[0].long.value;
+    let shortQtyAbs = (initialGross / 2) / aligned[0].short.value;
+    let prevLongValue = aligned[0].long.value;
+    let prevShortValue = aligned[0].short.value;
+    let cumLong = 0;
+    let cumShort = 0;
+    let cumBorrow = 0;
+    let cumCosts = 0;
+    let lastRebalanceIdx = 0;
+    const rows = [{
+      date: aligned[0].date,
+      longPnl: 0,
+      shortPnl: 0,
+      borrow: 0,
+      transactionCosts: 0,
+      netPnl: 0,
+      exposureRatio: 0,
+      longMarketValue: longQty * aligned[0].long.value,
+      shortMarketValueAbs: shortQtyAbs * aligned[0].short.value,
+      rebalance: true,
+      rebalanceReason: "initial",
+    }];
+
+    for (let i = 1; i < aligned.length; i += 1) {
+      const p = aligned[i];
+      const longPnl = longQty * (p.long.value - prevLongValue);
+      const shortPnl = -shortQtyAbs * (p.short.value - prevShortValue);
+      const borrow = shortQtyAbs * prevShortValue * interpolateBorrow(p.date, borrowByDate, fallbackBorrowAnnual);
+      cumLong += longPnl;
+      cumShort += shortPnl;
+      cumBorrow += borrow;
+
+      let longMv = longQty * p.long.value;
+      let shortMvAbs = shortQtyAbs * p.short.value;
+      const er = exposureRatio(longMv, shortMvAbs);
+      const cadenceDue = (i - lastRebalanceIdx) >= rebalanceEvery;
+      const driftDue = er > driftThreshold;
+      let dayCost = 0;
+      let reason = "";
+      if (cadenceDue || driftDue) {
+        const target = driftDue
+          ? rebalanceToDrift(longMv, shortMvAbs, hedgeToRatio)
+          : { targetLong: (longMv + shortMvAbs) / 2, targetShortAbs: (longMv + shortMvAbs) / 2 };
+        const longTrade = target.targetLong - longMv;
+        const shortTrade = target.targetShortAbs - shortMvAbs;
+        const longRef = Number.isFinite(longMedianDollarVol) ? longMedianDollarVol : (Number.isFinite(p.long.aum) ? p.long.aum : initialGross);
+        const shortRef = Number.isFinite(shortMedianDollarVol) ? shortMedianDollarVol : (Number.isFinite(p.short.aum) ? p.short.aum : initialGross);
+        dayCost += slippageCost(longTrade, longRef, costParams);
+        dayCost += slippageCost(shortTrade, shortRef, costParams);
+        cumCosts += dayCost;
+        longQty = target.targetLong / p.long.value;
+        shortQtyAbs = target.targetShortAbs / p.short.value;
+        longMv = target.targetLong;
+        shortMvAbs = target.targetShortAbs;
+        lastRebalanceIdx = i;
+        reason = cadenceDue && driftDue ? "cadence+drift" : (driftDue ? "drift" : "cadence");
+      }
+
+      rows.push({
+        date: p.date,
+        longPnl: cumLong,
+        shortPnl: cumShort,
+        borrow: cumBorrow,
+        transactionCosts: cumCosts,
+        netPnl: cumLong + cumShort - cumBorrow - cumCosts,
+        exposureRatio: exposureRatio(longMv, shortMvAbs),
+        longMarketValue: longMv,
+        shortMarketValueAbs: shortMvAbs,
+        rebalance: Boolean(reason),
+        rebalanceReason: reason,
+      });
+      prevLongValue = p.long.value;
+      prevShortValue = p.short.value;
+    }
+
+    const last = rows[rows.length - 1];
+    return {
+      ok: true,
+      rows,
+      summary: {
+        observations: rows.length,
+        startDate: rows[0].date,
+        endDate: last.date,
+        longPnl: last.longPnl,
+        shortPnl: last.shortPnl,
+        borrow: last.borrow,
+        transactionCosts: last.transactionCosts,
+        netPnl: last.netPnl,
+        rebalanceCount: rows.filter((r) => r.rebalance).length,
+        longMedianSharesTraded: Number.isFinite(longMedianShares) ? longMedianShares : null,
+        shortMedianSharesTraded: Number.isFinite(shortMedianShares) ? shortMedianShares : null,
+      },
+      settings: { initialGross, rebalanceEvery, driftThreshold, hedgeToRatio, costParams },
+    };
+  }
+
+  /** Minimum span before CAGR is meaningful (short windows annualize pathologically). */
+  const MIN_TRADING_DAYS_FOR_CAGR = 20;
+  /** Calendar span paired with the 20-trading-day CAGR gate. */
+  const MIN_CALENDAR_YEARS_FOR_CAGR = 20 / 365.25;
+
+  /**
+   * Expanding-window risk metrics on **mark-to-market equity** = gross + cumulative net PnL.
+   * @param {Array<{date:string, netPnl:number}>} rows `result.rows` sorted ascending by date
+   */
+  function computePairBacktestRiskSeries(rows, gross) {
+    const G = typeof gross === "number" && Number.isFinite(gross) && gross > 0 ? gross : 0;
+    if (!Array.isArray(rows) || rows.length < 3 || !(G > 0)) return [];
+    const sorted = [...rows].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const equity = [];
+    for (const r of sorted) {
+      const np = toNum(r.netPnl);
+      if (!Number.isFinite(np)) return [];
+      equity.push(G + np);
+    }
+    const parseD = (ds) => {
+      const d = new Date(`${String(ds || "").trim()}T00:00:00Z`);
+      return Number.isNaN(d.getTime()) ? null : d;
+    };
+    const MIN_I = 5;
+    const out = [];
+    const eq0abs = Math.abs(equity[0]);
+    if (!(eq0abs > 1e-9)) return [];
+
+    for (let i = MIN_I; i < sorted.length; i += 1) {
+      const d0 = parseD(sorted[0].date);
+      const di = parseD(sorted[i].date);
+      const eq0 = equity[0];
+      const eqI = equity[i];
+      if (!d0 || !di) continue;
+
+      const rets = [];
+      for (let j = 1; j <= i; j += 1) {
+        const prev = equity[j - 1];
+        const cur = equity[j];
+        const denom = Math.abs(prev) > 1e-9 ? Math.abs(prev) : 1e-9;
+        rets.push((cur - prev) / denom);
+      }
+      const n = rets.length;
+      if (n < 2) continue;
+      const mean = rets.reduce((a, b) => a + b, 0) / n;
+      let varSum = 0;
+      for (let k = 0; k < rets.length; k += 1) varSum += (rets[k] - mean) ** 2;
+      const std = Math.sqrt(varSum / (n - 1));
+      const annVol = Number.isFinite(std) && std > 1e-12 ? std * Math.sqrt(252) : 0;
+      const sharpe = std > 1e-12 ? (mean / std) * Math.sqrt(252) : 0;
+
+      let peak = equity[0];
+      let maxDd = 0;
+      for (let k = 0; k <= i; k += 1) {
+        const e = equity[k];
+        if (e > peak) peak = e;
+        if (peak > 1e-9) {
+          const dd = (peak - e) / peak;
+          if (dd > maxDd) maxDd = dd;
+        }
+      }
+
+      const msPerYear = 365.25 * 86400000;
+      const years = (di.getTime() - d0.getTime()) / msPerYear;
+      const tradingSpan = i + 1;
+      let cagr = NaN;
+      if (
+        years >= MIN_CALENDAR_YEARS_FOR_CAGR
+        && tradingSpan >= MIN_TRADING_DAYS_FOR_CAGR
+        && eq0 > 0
+        && eqI > 0
+      ) {
+        cagr = (eqI / eq0) ** (1 / years) - 1;
+      }
+
+      out.push({
+        date: sorted[i].date,
+        cagr,
+        annVol,
+        maxDrawdown: maxDd,
+        sharpe,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Two-leg hedge vs ETF close (or NAV) and underlying adj. close, with **notional** hedge ratio h = |MV_etf| / |MV_und|
+   * on the two risk legs (split: MV_etf = h·G/(1+h), MV_und = G/(1+h) at rebalance).
+   *
+   * - **β ≥ 0**: short ETF, long underlying (borrow on ETF short only).
+   * - **β < 0**: short ETF, short underlying (borrow on ETF short only; underlying short borrow 0%).
+   *
+   * **Borrow (ETF short only):** `borrow_current` from `opts.borrowHistory` is fee-only (IBKR /
+   * `borrow_history.json`: **positive** annual fee). Legacy negative values are short_favorable_positive
+   * fees. Daily cash drag = **costDrag(rate) / 252 ×** trapezoid ETF short MV (`costDrag` via
+   * `annualBorrowCostDragPerShortDollar`). Forward-fill the latest history point with `date <= row date`,
+   * then fall back to `opts.avgBorrowAnnual` when unknown.
+   *
+   * **Rebalancing:** Every **N** trading days, if **|β-adj net/gross − anchor|** exceeds
+   * `netGrossTolerancePct` (percentage points), rebalance to target notionals and reset the anchor.
+   * Anchor is snapshotted at inception and after each rebalance.
+   *
+   * **ETF short leg:** mark-to-market on Yahoo total return when ``etf_adj_close`` is present
+   * (`−MV × adjReturn`; distributions embedded — no separate ex-date debit). Otherwise raw
+   * ``close_price``/``nav`` plus explicit distribution debits from ``opts.distributions`` on
+   * ex-dates (never both). Sizing, borrow, and t-costs always use tradeable close/NAV.
+   */
+  function simulateInversePairBacktest(rows, opts) {
+    const gross = Math.max(0, toNum(opts && opts.gross));
+    const hedgeRatioH = Math.max(1e-8, toNum(opts && opts.hedgeRatio));
+    let betaRow = toNum(opts && opts.delta);
+    if (!Number.isFinite(betaRow)) betaRow = toNum(opts && opts.beta);
+    const shortEtfLongUnd = !(Number.isFinite(betaRow) && betaRow < 0);
+    const everyN = Math.max(1, Math.floor(toNum(opts && opts.everyNDays) || 5));
+    const tolPct = toNum(opts && opts.netGrossTolerancePct);
+    const tolerance = Number.isFinite(tolPct) && tolPct >= 0 ? Math.min(tolPct / 100, 0.999) : 0.05;
+    const slippageBps = Math.max(0, toNum(opts && opts.slippageBps));
+    const borrowAnnualFallback = toNum(opts && opts.avgBorrowAnnual);
+    const betaAbs = Number.isFinite(betaRow) && Math.abs(betaRow) > 1e-12
+      ? Math.abs(betaRow)
+      : hedgeRatioH;
+
+    const borrowHist = Array.isArray(opts && opts.borrowHistory)
+      ? [...opts.borrowHistory]
+        .map((x) => ({ d: String((x && x.date) || "").trim(), b: toNum(x && x.borrow_current) }))
+        .filter((x) => x.d && Number.isFinite(x.b))
+        .sort((a, b) => a.d.localeCompare(b.d))
+      : [];
+    const distByDate = buildDistributionByDate(opts && opts.distributions);
+    const PB = globalObj.PriceBasis;
+    const etfSplitEvents = normalizeSplitEventList(opts && opts.splitEvents);
+    const undSplitEvents = normalizeSplitEventList(opts && opts.underlyingSplitEvents);
+    let trByDate = null;
+    if (
+      (etfSplitEvents.length > 0 || undSplitEvents.length > 0)
+      && PB
+      && typeof PB.buildTrSeriesFromMetrics === "function"
+    ) {
+      const trRows = PB.buildTrSeriesFromMetrics(rows, etfSplitEvents, undSplitEvents);
+      if (trRows.length) trByDate = new Map(trRows.map((r) => [r.date, r]));
+    }
+
+    if (!Array.isArray(rows) || rows.length < 2 || !Number.isFinite(gross) || gross <= 0) {
+      return { ok: false, error: "Invalid rows or gross capital.", daily: [], rebalanceMarks: [], summary: {} };
+    }
+
+    let pts = [];
+    for (const row of rows) {
+      const rawPl = toNum(row && row.close_price) || toNum(row && row.nav);
+      const pa = toNum(row && row.etf_adj_close);
+      const ps = toNum(row && row.underlying_adj_close);
+      const ds = String((row && row.date) || "").trim();
+      const tr = trByDate ? trByDate.get(ds) : null;
+      const pl = tr && toNum(tr.tradeClose) > 0 ? toNum(tr.tradeClose) : rawPl;
+      if (!ds || !Number.isFinite(pl) || pl <= 0 || !Number.isFinite(ps) || ps <= 0) continue;
+      const trPx = tr && Number.isFinite(tr.trEtfPx) && tr.trEtfPx > 0 ? tr.trEtfPx : NaN;
+      const trUndPx = tr && Number.isFinite(tr.trUndPx) && tr.trUndPx > 0 ? tr.trUndPx : NaN;
+      pts.push({
+        date: ds,
+        pl,
+        pa: trPx > 0 ? NaN : (Number.isFinite(pa) && pa > 0 ? pa : NaN),
+        trPx,
+        trUndPx,
+        trMode: tr ? tr.trMode : null,
+        ps,
+        sourceKey: [
+          row && row.source_provider,
+          row && row.source_url,
+          row && row.status,
+        ].map((v) => String(v || "").trim().toLowerCase()).join("|"),
+      });
+    }
+    pts = keepLatestContiguousPoints(pts);
+    if (pts.length < 3) {
+      return {
+        ok: false,
+        error: "Need at least 3 days with ETF close (or NAV) and underlying adj. close.",
+        daily: [],
+        rebalanceMarks: [],
+        summary: {},
+      };
+    }
+
+    function targetEtfWeightInGross(h) {
+      const hh = Math.max(1e-12, h);
+      return hh / (1 + hh);
+    }
+
+    let borrowWalk = 0;
+    let lastBorrowCanon = NaN;
+    function advanceBorrowForDate(ds) {
+      while (borrowWalk < borrowHist.length && borrowHist[borrowWalk].d <= ds) {
+        lastBorrowCanon = borrowHist[borrowWalk].b;
+        borrowWalk += 1;
+      }
+    }
+
+    let qE = 0;
+    let qU = 0;
+    let lastRebal = -1;
+    let daysSinceRebal = 0;
+    let cumEtf = 0;
+    let cumUnd = 0;
+    let cumBorrow = 0;
+    let cumTc = 0;
+    let cumDistributions = 0;
+    let nDaysAdjClose = 0;
+    let nDaysPriceFallback = 0;
+    const daily = [];
+    const rebalanceMarks = [];
+
+    function computeBetaNetGrossRatio(mvEtfAbs, mvUndAbs) {
+      const adj = mvEtfAbs * betaAbs;
+      const g = adj + mvUndAbs;
+      return g > 1e-12 ? Math.abs(adj - mvUndAbs) / g : 0;
+    }
+
+    let anchorBetaNetGross = 0;
+
+    function snapshotAnchor(i) {
+      const p = pts[i];
+      const mE = qE * p.pl;
+      const mU = qU * p.ps;
+      anchorBetaNetGross = computeBetaNetGrossRatio(mE, mU);
+    }
+
+    function rebalanceAt(i, reason) {
+      const { pl, ps, date } = pts[i];
+      const h = hedgeRatioH;
+      if (!(pl > 0) || !(ps > 0)) return false;
+      const mvEtf = (gross * h) / (1 + h);
+      const mvUnd = gross / (1 + h);
+      const qENew = mvEtf / pl;
+      const qUNew = mvUnd / ps;
+      if (lastRebal >= 0) {
+        const tradeNotional = Math.abs(qENew - qE) * pl + Math.abs(qUNew - qU) * ps;
+        cumTc += (tradeNotional * slippageBps) / 10000;
+      }
+      qE = qENew;
+      qU = qUNew;
+      lastRebal = i;
+      daysSinceRebal = 0;
+      rebalanceMarks.push({ date, reason });
+      snapshotAnchor(i);
+      return true;
+    }
+
+    rebalanceAt(0, "inception");
+    advanceBorrowForDate(pts[0].date);
+
+    for (let i = 1; i < pts.length; i += 1) {
+      const cur = pts[i];
+      const prev = pts[i - 1];
+      const etfDay = computeEtfShortDayPnl(qE, prev, cur, distByDate);
+      const dEtf = etfDay.pnl;
+      cumEtf += dEtf;
+      cumDistributions += etfDay.divDebit;
+      if (etfDay.mode === "adj_close" || etfDay.mode === "tr_price" || String(etfDay.mode || "").startsWith("pre_split")
+        || String(etfDay.mode || "").startsWith("split_adj_normalized")
+        || etfDay.mode === "post_split" || etfDay.mode === "continuous_adj") nDaysAdjClose += 1;
+      else nDaysPriceFallback += 1;
+      const prevUndPx = underlyingPxForPoint(prev);
+      const curUndPx = underlyingPxForPoint(cur);
+      const dps = Number.isFinite(prevUndPx) && Number.isFinite(curUndPx) ? curUndPx - prevUndPx : cur.ps - prev.ps;
+      const dUnd = shortEtfLongUnd ? qU * dps : -qU * dps;
+      cumUnd += dUnd;
+
+      const splitAdj = applyCrossSplitQuantityAdjust(qE, qU, prev, cur, etfSplitEvents, undSplitEvents);
+      qE = splitAdj.qE;
+      qU = splitAdj.qU;
+
+      advanceBorrowForDate(cur.date);
+      const canon = Number.isFinite(lastBorrowCanon) ? lastBorrowCanon : borrowAnnualFallback;
+      const annualDragPerShortDollar = annualBorrowCostDragPerShortDollar(canon);
+      const borrowBase = qE * 0.5 * (prev.pl + cur.pl);
+      const borrowDay = borrowBase * (annualDragPerShortDollar / 252);
+      cumBorrow += borrowDay;
+
+      let mvEtfAbs = qE * cur.pl;
+      let mvUndAbs = qU * cur.ps;
+      let mvEtfBetaAdj = mvEtfAbs * betaAbs;
+      let grossBeta = mvEtfBetaAdj + mvUndAbs;
+      let netBeta = Math.abs(mvEtfBetaAdj - mvUndAbs);
+      let netGrossBeta = grossBeta > 1e-12 ? netBeta / grossBeta : 0;
+      let grossMvRaw = mvEtfAbs + mvUndAbs;
+      let netMvRaw = Math.abs(mvEtfAbs - mvUndAbs);
+      let netGrossRaw = grossMvRaw > 1e-12 ? netMvRaw / grossMvRaw : 0;
+      let wEtfInGross = grossMvRaw > 1e-9 ? mvEtfAbs / grossMvRaw : 0;
+      const wTarget = targetEtfWeightInGross(hedgeRatioH);
+      daysSinceRebal += 1;
+
+      let rebalReason = "";
+      if (daysSinceRebal >= everyN) {
+        if (Math.abs(netGrossBeta - anchorBetaNetGross) > tolerance) {
+          rebalReason = "beta_net_gross";
+          rebalanceAt(i, rebalReason);
+          mvEtfAbs = qE * cur.pl;
+          mvUndAbs = qU * cur.ps;
+          mvEtfBetaAdj = mvEtfAbs * betaAbs;
+          grossBeta = mvEtfBetaAdj + mvUndAbs;
+          netBeta = Math.abs(mvEtfBetaAdj - mvUndAbs);
+          netGrossBeta = grossBeta > 1e-12 ? netBeta / grossBeta : 0;
+          grossMvRaw = mvEtfAbs + mvUndAbs;
+          netMvRaw = Math.abs(mvEtfAbs - mvUndAbs);
+          netGrossRaw = grossMvRaw > 1e-12 ? netMvRaw / grossMvRaw : 0;
+          wEtfInGross = grossMvRaw > 1e-9 ? mvEtfAbs / grossMvRaw : 0;
+        } else {
+          daysSinceRebal = 0;
+        }
+      }
+
+      const netPnl = cumEtf + cumUnd - cumBorrow - cumTc;
+      daily.push({
+        date: cur.date,
+        netPnl,
+        longPnl: cumEtf,
+        shortPnl: cumUnd,
+        borrow: cumBorrow,
+        distributions: cumDistributions,
+        tCosts: cumTc,
+        netGross: netGrossBeta,
+        netGrossRaw,
+        netGrossBeta,
+        mvEtfAbs,
+        mvUndAbs,
+        mvEtfBetaAdj,
+        wEtfInGross,
+        wTarget,
+        rebal: rebalReason || "",
+      });
+    }
+
+    const etfReturnMode = nDaysAdjClose > 0 && nDaysPriceFallback === 0
+      ? "adj_close"
+      : (nDaysAdjClose === 0 && nDaysPriceFallback > 0 ? "price_fallback" : "mixed");
+    const summary = {
+      netPnl: cumEtf + cumUnd - cumBorrow - cumTc,
+      longPnl: cumEtf,
+      shortPnl: cumUnd,
+      borrowPaid: cumBorrow,
+      distributionsPaid: cumDistributions,
+      tCosts: cumTc,
+      nDays: pts.length,
+      nRebalances: rebalanceMarks.length,
+      etfReturnMode,
+      nDaysAdjClose,
+      nDaysPriceFallback,
+    };
+    const chartRows = daily.map((d) => ({
+      date: d.date,
+      netPnl: d.netPnl,
+      longPnl: d.longPnl,
+      shortPnl: d.shortPnl,
+      borrow: d.borrow,
+      distributions: d.distributions,
+      transactionCosts: d.tCosts,
+      exposureRatio: d.netGrossBeta,
+      mvEtfAbs: d.mvEtfAbs,
+      mvUndAbs: d.mvUndAbs,
+      mvEtfBetaAdj: d.mvEtfBetaAdj,
+      rebalance: Boolean(d.rebal),
+      rebalanceReason: d.rebal || "",
+    }));
+    const legChartLabels = shortEtfLongUnd
+      ? { etf: "ETF (short)", und: "Underlying (long)" }
+      : { etf: "ETF (short)", und: "Underlying (short)" };
+    return {
+      ok: true,
+      daily,
+      rows: chartRows,
+      rebalanceMarks,
+      summary,
+      inception: pts[0].date,
+      end: pts[pts.length - 1].date,
+      strategy: shortEtfLongUnd ? "short_etf_long_und" : "short_both",
+      betaUsed: Number.isFinite(betaRow) ? betaRow : null,
+      legChartLabels,
+      breachTolerancePct: tolerance * 100,
+    };
+  }
+
+  function normalizeShortFlowLeg(raw) {
+    const sym = String(raw && raw.symbol || "").trim().toUpperCase();
+    const flowDollars = Math.max(0, toNum(raw && raw.flowDollars));
+    if (!sym || !(flowDollars > 0) || raw.enabled === false) return null;
+    return { symbol: sym, flowDollars };
+  }
+
+  function resolveSplitEventPair(splitEvents) {
+    if (Array.isArray(splitEvents)) return { etf: splitEvents, und: [] };
+    if (splitEvents && typeof splitEvents === "object") {
+      return {
+        etf: Array.isArray(splitEvents.etf) ? splitEvents.etf : [],
+        und: Array.isArray(splitEvents.und) ? splitEvents.und : [],
+      };
+    }
+    return { etf: [], und: [] };
+  }
+
+  function prepareShortFlowPoints(rows, splitEvents) {
+    const { etf: etfSplitEvents, und: undSplitEvents } = resolveSplitEventPair(splitEvents);
+    const sourceRows = Array.isArray(rows) ? rows : [];
+    let pts = [];
+    let hasPreparedTr = false;
+    for (const row of sourceRows) {
+      const pl = toNum(row && row.close_price) || toNum(row && row.nav);
+      const pa = toNum(row && row.etf_adj_close);
+      const trPrepared = toNum(row && (row.trEtfPx ?? row.tr_etf_px));
+      if (Number.isFinite(trPrepared) && trPrepared > 0) hasPreparedTr = true;
+      const ds = String((row && row.date) || "").trim().slice(0, 10);
+      if (!ds || !Number.isFinite(pl) || pl <= 0) continue;
+      pts.push({
+        date: ds,
+        pl,
+        pa: Number.isFinite(trPrepared) && trPrepared > 0 ? NaN : (Number.isFinite(pa) && pa > 0 ? pa : NaN),
+        trPx: Number.isFinite(trPrepared) && trPrepared > 0 ? trPrepared : NaN,
+        trMode: Number.isFinite(trPrepared) && trPrepared > 0 ? (row.trMode || row.tr_mode || "prepared_tr") : null,
+        sourceKey: [
+          row && row.source_provider,
+          row && row.source_url,
+          row && row.status,
+        ].map((v) => String(v || "").trim().toLowerCase()).join("|"),
+      });
+    }
+    pts = keepLatestContiguousPoints(pts);
+    const PB = globalObj.PriceBasis;
+    if (
+      pts.length
+      && !hasPreparedTr
+      && (etfSplitEvents.length > 0 || undSplitEvents.length > 0)
+      && PB
+      && typeof PB.buildTrSeriesFromMetrics === "function"
+    ) {
+      const trRows = PB.buildTrSeriesFromMetrics(sourceRows, etfSplitEvents, undSplitEvents);
+      const trByDate = new Map(trRows.map((r) => [r.date, r]));
+      pts = pts.map((p) => {
+        const tr = trByDate.get(p.date);
+        return tr && Number.isFinite(tr.trEtfPx) && tr.trEtfPx > 0
+          ? { ...p, trPx: tr.trEtfPx, pa: NaN, trMode: tr.trMode || "tr_price" }
+          : p;
+      });
+    }
+    return pts;
+  }
+
+  /**
+   * Portfolio short-flow backtest. Adds a fixed short notional to each enabled
+   * ETF every N valid trading rows, starting when that ETF first has tradable
+   * prices. This is intentionally add-only; it does not hedge or cover.
+   */
+  function simulateShortFlowBacktest(opts) {
+    const everyN = Math.max(1, Math.floor(toNum(opts && opts.everyNDays) || 5));
+    const slippageBps = Math.max(0, toNum(opts && opts.slippageBps));
+    const startDate = String(opts && opts.startDate || "").trim().slice(0, 10);
+    const endDate = String(opts && opts.endDate || "").trim().slice(0, 10);
+    const metricsBySymbol = opts && opts.metricsBySymbol && typeof opts.metricsBySymbol === "object" ? opts.metricsBySymbol : {};
+    const recordsBySymbol = opts && opts.recordsBySymbol && typeof opts.recordsBySymbol === "object" ? opts.recordsBySymbol : {};
+    const borrowHistoryBySymbol = opts && opts.borrowHistoryBySymbol && typeof opts.borrowHistoryBySymbol === "object" ? opts.borrowHistoryBySymbol : {};
+    const distributionsBySymbol = opts && opts.distributionsBySymbol && typeof opts.distributionsBySymbol === "object" ? opts.distributionsBySymbol : {};
+    const splitEventsBySymbol = opts && opts.splitEventsBySymbol && typeof opts.splitEventsBySymbol === "object" ? opts.splitEventsBySymbol : {};
+    const legs = (Array.isArray(opts && opts.legs) ? opts.legs : []).map(normalizeShortFlowLeg).filter(Boolean);
+    if (!legs.length) return { ok: false, error: "Add at least one ETF with a positive flow amount.", rows: [], flowMarks: [], bySymbol: {}, summary: {} };
+
+    const states = [];
+    for (const leg of legs) {
+      const rawPts = prepareShortFlowPoints(metricsBySymbol[leg.symbol], splitEventsBySymbol[leg.symbol] || []);
+      const pts = rawPts.filter((p) => (!startDate || p.date >= startDate) && (!endDate || p.date <= endDate));
+      if (pts.length < 1) continue;
+      const rec = recordsBySymbol[leg.symbol] || {};
+      const fallbackBorrow = Number.isFinite(toNum(rec.borrow_avg_annual))
+        ? toNum(rec.borrow_avg_annual)
+        : toNum(rec.borrow_current);
+      states.push({
+        symbol: leg.symbol,
+        flowDollars: leg.flowDollars,
+        pts,
+        pointByDate: new Map(pts.map((p, idx) => [p.date, { p, idx }])),
+        borrowHist: (Array.isArray(borrowHistoryBySymbol[leg.symbol]) ? borrowHistoryBySymbol[leg.symbol] : [])
+          .map((x) => ({ d: String((x && x.date) || "").trim().slice(0, 10), b: toNum(x && x.borrow_current) }))
+          .filter((x) => x.d && Number.isFinite(x.b))
+          .sort((a, b) => a.d.localeCompare(b.d)),
+        borrowWalk: 0,
+        lastBorrowCanon: NaN,
+        fallbackBorrowAnnual: Number.isFinite(fallbackBorrow) ? fallbackBorrow : 0,
+        distByDate: buildDistributionByDate(distributionsBySymbol[leg.symbol]),
+        qShort: 0,
+        prevPoint: null,
+        cumPnl: 0,
+        cumBorrow: 0,
+        cumDist: 0,
+        cumTc: 0,
+        cumFlow: 0,
+        nFlows: 0,
+        nDaysAdjClose: 0,
+        nDaysPriceFallback: 0,
+        firstTradableDate: pts[0].date,
+        lastTradableDate: pts[pts.length - 1].date,
+      });
+    }
+    if (!states.length) return { ok: false, error: "No selected ETFs have tradable price history in this window.", rows: [], flowMarks: [], bySymbol: {}, summary: {} };
+
+    const allDates = Array.from(new Set(states.flatMap((s) => s.pts.map((p) => p.date)))).sort();
+    const rows = [];
+    const flowMarks = [];
+    let totalPnl = 0;
+    let totalBorrow = 0;
+    let totalDist = 0;
+    let totalTc = 0;
+    let totalFlow = 0;
+
+    function advanceBorrowForState(st, ds) {
+      while (st.borrowWalk < st.borrowHist.length && st.borrowHist[st.borrowWalk].d <= ds) {
+        st.lastBorrowCanon = st.borrowHist[st.borrowWalk].b;
+        st.borrowWalk += 1;
+      }
+      return Number.isFinite(st.lastBorrowCanon) ? st.lastBorrowCanon : st.fallbackBorrowAnnual;
+    }
+
+    for (const ds of allDates) {
+      let dayFlow = 0;
+      let activeSymbols = 0;
+      for (const st of states) {
+        const hit = st.pointByDate.get(ds);
+        if (!hit) continue;
+        const cur = hit.p;
+        if (st.prevPoint && st.qShort > 0) {
+          const prevShortMv = st.qShort * st.prevPoint.pl;
+          const etfDay = computeEtfShortDayPnl(st.qShort, st.prevPoint, cur, st.distByDate);
+          st.cumPnl += etfDay.pnl;
+          st.cumDist += etfDay.divDebit;
+          const modeStr = String(etfDay.mode || "");
+          if (etfDay.mode === "adj_close" || etfDay.mode === "tr_price" || modeStr.startsWith("pre_split")
+            || modeStr.startsWith("post_split") || etfDay.mode === "continuous_adj") st.nDaysAdjClose += 1;
+          else st.nDaysPriceFallback += 1;
+
+          const canon = advanceBorrowForState(st, ds);
+          const annualDragPerShortDollar = annualBorrowCostDragPerShortDollar(canon);
+          let curShortMvForBorrow = st.qShort * cur.pl;
+          const prevTr = st.prevPoint.trPx;
+          const curTr = cur.trPx;
+          if (Number.isFinite(prevTr) && prevTr > 0 && Number.isFinite(curTr) && curTr > 0) {
+            curShortMvForBorrow = prevShortMv * (curTr / prevTr);
+          }
+          const borrowBase = 0.5 * (prevShortMv + curShortMvForBorrow);
+          st.cumBorrow += borrowBase * (annualDragPerShortDollar / 252);
+          if (
+            Number.isFinite(prevTr) && prevTr > 0
+            && Number.isFinite(curTr) && curTr > 0
+            && Number.isFinite(curShortMvForBorrow) && curShortMvForBorrow > 0
+            && Number.isFinite(cur.pl) && cur.pl > 0
+          ) {
+            st.qShort = curShortMvForBorrow / cur.pl;
+          }
+        } else {
+          advanceBorrowForState(st, ds);
+        }
+
+        if (hit.idx % everyN === 0) {
+          const addShares = st.flowDollars / cur.pl;
+          st.qShort += addShares;
+          st.cumFlow += st.flowDollars;
+          st.nFlows += 1;
+          const tc = st.flowDollars * (slippageBps / 10000);
+          st.cumTc += tc;
+          dayFlow += st.flowDollars;
+          flowMarks.push({ date: ds, symbol: st.symbol, dollars: st.flowDollars, price: cur.pl, shares: addShares, transactionCost: tc });
+        }
+        if (st.qShort > 0) activeSymbols += 1;
+        st.prevPoint = cur;
+      }
+
+      totalPnl = states.reduce((a, st) => a + st.cumPnl, 0);
+      totalBorrow = states.reduce((a, st) => a + st.cumBorrow, 0);
+      totalDist = states.reduce((a, st) => a + st.cumDist, 0);
+      totalTc = states.reduce((a, st) => a + st.cumTc, 0);
+      totalFlow = states.reduce((a, st) => a + st.cumFlow, 0);
+      const currentShortMarketValue = states.reduce((a, st) => {
+        const p = st.prevPoint;
+        return a + (p && st.qShort > 0 ? st.qShort * p.pl : 0);
+      }, 0);
+      rows.push({
+        date: ds,
+        netPnl: totalPnl - totalBorrow - totalTc,
+        longPnl: totalPnl,
+        shortPnl: 0,
+        shortEtfPnl: totalPnl,
+        borrow: totalBorrow,
+        distributions: totalDist,
+        transactionCosts: totalTc,
+        tCosts: totalTc,
+        cumulativeFlowAdded: totalFlow,
+        currentShortMarketValue,
+        flowAddedToday: dayFlow,
+        activeSymbols,
+        exposureRatio: totalFlow > 0 ? currentShortMarketValue / totalFlow : 0,
+        mvEtfAbs: currentShortMarketValue,
+        mvUndAbs: 0,
+        rebalance: dayFlow > 0,
+        rebalanceReason: dayFlow > 0 ? "flow" : "",
+      });
+    }
+
+    const bySymbol = {};
+    for (const st of states) {
+      const last = st.prevPoint;
+      const currentShortMarketValue = last && st.qShort > 0 ? st.qShort * last.pl : 0;
+      bySymbol[st.symbol] = {
+        symbol: st.symbol,
+        flowDollars: st.flowDollars,
+        firstTradableDate: st.firstTradableDate,
+        lastTradableDate: st.lastTradableDate,
+        nFlows: st.nFlows,
+        cumulativeFlowAdded: st.cumFlow,
+        currentShortMarketValue,
+        shortEtfPnl: st.cumPnl,
+        borrowPaid: st.cumBorrow,
+        distributionsPaid: st.cumDist,
+        tCosts: st.cumTc,
+        netPnl: st.cumPnl - st.cumBorrow - st.cumTc,
+        nDaysAdjClose: st.nDaysAdjClose,
+        nDaysPriceFallback: st.nDaysPriceFallback,
+      };
+    }
+    const last = rows[rows.length - 1];
+    return {
+      ok: true,
+      rows,
+      flowMarks,
+      bySymbol,
+      summary: {
+        observations: rows.length,
+        startDate: rows[0] && rows[0].date,
+        endDate: last && last.date,
+        netPnl: last ? last.netPnl : 0,
+        shortEtfPnl: last ? last.shortEtfPnl : 0,
+        borrowPaid: last ? last.borrow : 0,
+        distributionsPaid: last ? last.distributions : 0,
+        tCosts: last ? last.transactionCosts : 0,
+        cumulativeFlowAdded: last ? last.cumulativeFlowAdded : 0,
+        currentShortMarketValue: last ? last.currentShortMarketValue : 0,
+        nFlowOrders: flowMarks.length,
+        nSymbols: states.length,
+      },
+      inception: rows[0] && rows[0].date,
+      end: last && last.date,
+      legChartLabels: { etf: "Short ETF basket", und: "Unused" },
+      settings: { everyN, slippageBps, startDate, endDate },
+    };
+  }
+
+  const exported = {
+    alignPair,
+    median,
+    buildDistributionByDate,
+    computeEtfShortDayPnl,
+    annualBorrowCostDragPerShortDollar,
+    runPairBacktest,
+    slippageCost,
+    exposureRatio,
+    simulateInversePairBacktest,
+    simulateShortFlowBacktest,
+    computePairBacktestRiskSeries,
+    parseShortFlowBacktestRoute,
+    MIN_TRADING_DAYS_FOR_CAGR,
+    MIN_CALENDAR_YEARS_FOR_CAGR,
+  };
+
+  if (typeof module !== "undefined" && module.exports) module.exports = exported;
+  if (globalObj) globalObj.PairBacktest = exported;
+})(typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : globalThis);

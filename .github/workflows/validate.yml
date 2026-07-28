@@ -1,0 +1,30 @@
+name: Validate public boundary
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Enforce public-only repository
+        run: python scripts/validate_public_boundary.py
+      - name: Check browser assets
+        run: |
+          for file in assets/*.js; do
+            node --check "$file"
+          done
+      - name: Run dashboard unit tests
+        run: |
+          for test_file in tests/*.js; do
+            node "$test_file"
+          done
