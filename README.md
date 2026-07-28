@@ -31,5 +31,8 @@ python scripts/validate_public_boundary.py
 node --check assets/expected_decay.js
 ```
 
-The dashboard is public. It does not contain a client-side password file or
-account-specific Clear Street data.
+The dashboard presents a login screen for exactly `dgoldman` and `dmeis`.
+Passwords are checked against PBKDF2 hashes in `data/investors.json`; plaintext
+passwords and account-specific Clear Street data are not stored here. Because
+this is a static public site, the login is a user-interface gate rather than
+server-enforced access control.

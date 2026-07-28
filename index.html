@@ -13473,8 +13473,6 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
   const [showNews, setShowNews] = useState(false);
   const [showFlow, setShowFlow] = useState(false);
   const [showYbEdge, setShowYbEdge] = useState(false);
-  const [showBacktestFlow, setShowBacktestFlow] = useState(false);
-  const [backtestFlowPreloadSymbol, setBacktestFlowPreloadSymbol] = useState('');
   const [eventCalendar, setEventCalendar] = useState(null);
   const [letfFlowsCache, setLetfFlowsCache] = useState(LETF_REBALANCE_FLOWS_CACHE);
   const [letfIntradayCache, setLetfIntradayCache] = useState(LETF_INTRADAY_FLOWS_CACHE);
@@ -13652,22 +13650,7 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
   useEffect(() => {
     const handleHash = () => {
       const hash = window.location.hash;
-      const flowRoute = window.PairBacktest && typeof window.PairBacktest.parseShortFlowBacktestRoute === 'function'
-        ? window.PairBacktest.parseShortFlowBacktestRoute(hash)
-        : { matches: false };
-      if (flowRoute?.matches) {
-        setChartRecord(null);
-        setShowInfo(false);
-        setShowNews(false);
-        setShowFlow(false);
-        setShowYbEdge(false);
-        setShowOps(false);
-        setShowBacktestFlow(true);
-        setBacktestFlowPreloadSymbol(String(flowRoute.preloadSymbol || '').toUpperCase());
-        setChartDefaultPanel('chart');
-        return;
-      }
-      const chartMatch = /^#\/chart\/([^/]+)(?:\/(backtest-flow|backtest|flow|trade|vrp|decay))?$/i.exec(hash);
+      const chartMatch = /^#\/chart\/([^/]+)(?:\/(backtest|flow|trade|vrp|decay))?$/i.exec(hash);
       if (chartMatch && data) {
         const sym = decodeURIComponent(chartMatch[1]).toUpperCase();
         const rec = (data.records || []).find(r => r.symbol === sym);
@@ -13678,8 +13661,6 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
           setShowFlow(false);
           setShowYbEdge(false);
           setShowOps(false);
-          setShowBacktestFlow(false);
-          setBacktestFlowPreloadSymbol('');
           const panel = String(chartMatch[2] || '').toLowerCase();
           setChartDefaultPanel(
             panel === 'backtest' ? 'backtest'
@@ -13699,8 +13680,6 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
         setShowFlow(false);
         setShowYbEdge(false);
         setShowOps(false);
-        setShowBacktestFlow(false);
-        setBacktestFlowPreloadSymbol('');
         return;
       }
       if (hash === '#/flow') {
@@ -13710,8 +13689,6 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
         setShowFlow(true);
         setShowYbEdge(false);
         setShowOps(false);
-        setShowBacktestFlow(false);
-        setBacktestFlowPreloadSymbol('');
         return;
       }
       if (hash === '#/yb-edge') {
@@ -13721,8 +13698,6 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
         setShowFlow(false);
         setShowYbEdge(true);
         setShowOps(false);
-        setShowBacktestFlow(false);
-        setBacktestFlowPreloadSymbol('');
         return;
       }
       if (hash === '#/ops') {
@@ -13732,8 +13707,6 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
         setShowFlow(false);
         setShowYbEdge(false);
         setShowOps(true);
-        setShowBacktestFlow(false);
-        setBacktestFlowPreloadSymbol('');
         return;
       }
       if (hash === '#/backtest') {
@@ -13745,8 +13718,6 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
       setShowFlow(false);
       setShowYbEdge(false);
       setShowOps(false);
-      setShowBacktestFlow(false);
-      setBacktestFlowPreloadSymbol('');
       setChartDefaultPanel('chart');
     };
     handleHash();
@@ -13776,11 +13747,6 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
 
   const navigateToOps = useCallback(() => {
     window.location.hash = '/ops';
-  }, []);
-
-  const navigateToBacktestFlow = useCallback((symbol = '') => {
-    const sym = String(symbol || '').trim().toUpperCase();
-    window.location.hash = sym ? `/backtest-flow/${encodeURIComponent(sym)}` : '/backtest-flow';
   }, []);
 
   // Lazy-load the combined event calendar once when the YB Edge page is first
@@ -13953,19 +13919,12 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
             ⌁ Flow
           </button>
           <button
-            className={cls('topbar-btn', showBacktestFlow && !chartRecord && 'active')}
-            onClick={() => { if (showBacktestFlow) navigateBack(); else navigateToBacktestFlow(); }}
-            title="Recurring short-flow portfolio backtest"
-          >
-            Backtest Flow
-          </button>
-          <button
             className={cls('topbar-btn', showNews && !chartRecord && 'active')}
             onClick={() => { if (showNews) navigateBack(); else navigateToNews(); }}
           >
             ▦ News
           </button>
-          <button className={cls('topbar-btn', showInfo && !chartRecord && !showNews && !showFlow && !showYbEdge && !showBacktestFlow && !showOps && 'active')} onClick={() => { navigateBack(); setShowInfo(s => !s); }}>
+          <button className={cls('topbar-btn', showInfo && !chartRecord && !showNews && !showFlow && !showYbEdge && !showOps && 'active')} onClick={() => { navigateBack(); setShowInfo(s => !s); }}>
             ◉ Info
           </button>
         </div>
@@ -14000,13 +13959,6 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
           intradayPayload={letfIntradayCache}
           intradayError={letfIntradayError}
           bucketOf={bucketOf}
-          onNavigateToChart={navigateToChart}
-        />
-      ) : showBacktestFlow ? (
-        <BacktestFlowPage
-          records={records}
-          preloadSymbol={backtestFlowPreloadSymbol}
-          dashboardBuildTime={data.build_time}
           onNavigateToChart={navigateToChart}
         />
       ) : showOps ? (

@@ -33,7 +33,6 @@ FORBIDDEN_PATH_PARTS = {
     "site",
 }
 FORBIDDEN_FILES = {
-    "data/investors.json",
     "daily_screener.py",
     "docker-compose.yml",
     "Dockerfile",
@@ -46,7 +45,6 @@ FORBIDDEN_PATTERNS = (
     re.compile(r"(?i)\bCLEARSTREET_(?:CLIENT_SECRET|OLYMPUS_API_KEY|STUDIO_API_TOKEN)\b"),
     re.compile(r"(?i)\b(?:CS_SFTP_PRIVATE_KEY|DC_DASHBOARD_TOKEN)\s*="),
     re.compile(r"(?i)\bstahl\b"),
-    re.compile(r"(?i)\b(?:dgoldman|dmeis)\b"),
     re.compile(r"(?i)sftp-static\.clearstreet\.io"),
 )
 FORBIDDEN_JSON_KEYS = {
@@ -62,6 +60,7 @@ FORBIDDEN_JSON_KEYS = {
 }
 REQUIRED_FILES = {
     "index.html",
+    "data/investors.json",
     "data/dashboard_data.json",
     "data/borrow_history.json",
     "data/etf_metrics_daily.json",
@@ -99,7 +98,7 @@ def validate() -> None:
             raise AssertionError(f"private path in public repository: {rel}")
         if path.stat().st_size > MAX_FILE_BYTES:
             raise AssertionError(f"oversized public file: {rel}")
-        if rel == "scripts/validate_public_boundary.py":
+        if rel in {"scripts/validate_public_boundary.py", "data/investors.json"}:
             continue
         if path.suffix.lower() in {".html", ".js", ".json", ".csv", ".md", ".yml", ".yaml"}:
             text = path.read_text(encoding="utf-8", errors="ignore")
@@ -119,6 +118,19 @@ def validate() -> None:
         raise AssertionError("dashboard_data.json was not sanitized for DC-Dashboard")
     if "last_commit" in dashboard:
         raise AssertionError("private commit metadata leaked into dashboard_data.json")
+
+    investors = json.loads((ROOT / "data/investors.json").read_text(encoding="utf-8"))
+    users = investors.get("users")
+    allowed_users = {"dgoldman", "dmeis"}
+    if not isinstance(users, list) or {
+        str(user.get("id", "")).lower() for user in users if isinstance(user, dict)
+    } != allowed_users or len(users) != len(allowed_users):
+        raise AssertionError("dashboard login must contain exactly dgoldman and dmeis")
+    for user in users:
+        if set(user) != {"id", "name", "salt_b64", "hash_b64", "iterations"}:
+            raise AssertionError("dashboard login contains an unexpected credential field")
+        if not user["salt_b64"] or not user["hash_b64"] or int(user["iterations"]) < 250_000:
+            raise AssertionError("dashboard login hash is incomplete or too weak")
 
     manifest = json.loads(
         (ROOT / "data/public_bundle_manifest.json").read_text(encoding="utf-8")

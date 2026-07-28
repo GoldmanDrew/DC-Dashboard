@@ -17,7 +17,9 @@ Never add:
 - portfolio construction, sizing, solver, cadence, hedge, or ratchet code;
 - `dcq/`, private config, broker clients, account reports, positions, NAV, P&L,
   trades, financing, or private risk snapshots;
-- credentials, password hashes, account identifiers, private keys, or `.env`;
+- plaintext credentials, account identifiers, private keys, or `.env`;
+- any dashboard login other than the two PBKDF2-hashed users in
+  `data/investors.json`;
 - a checkout, submodule, package import, or runtime dependency on
   `Diamond-Creek-Execution`.
 
