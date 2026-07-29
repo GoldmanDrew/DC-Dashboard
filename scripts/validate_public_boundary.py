@@ -83,6 +83,50 @@ def _walk_json(value: object, rel: str) -> None:
             stack.extend(current)
 
 
+def _manifest_file_bytes(path: Path) -> bytes:
+    """Hash bytes as committed on Linux CI: normalize text newlines to LF."""
+    raw = path.read_bytes()
+    if path.suffix.lower() in {".json", ".csv", ".md", ".html", ".js", ".yml", ".yaml", ".txt"}:
+        return raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return raw
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(_manifest_file_bytes(path)).hexdigest()
+
+
+def rebuild_public_bundle_manifest() -> dict:
+    """Rewrite ``data/public_bundle_manifest.json`` with LF-stable hashes."""
+    files: list[dict] = []
+    data_root = ROOT / "data"
+    for path in sorted(p for p in data_root.rglob("*") if p.is_file()):
+        rel = path.relative_to(ROOT).as_posix()
+        if rel == "data/public_bundle_manifest.json":
+            continue
+        payload = _manifest_file_bytes(path)
+        files.append(
+            {
+                "path": rel,
+                "bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+    manifest = {
+        "schema_version": 1,
+        "source": "sanitized-private-export",
+        "public_repository": "GoldmanDrew/DC-Dashboard",
+        "history_days": 120,
+        "max_points_per_symbol": 120,
+        "files": files,
+    }
+    (data_root / "public_bundle_manifest.json").write_text(
+        json.dumps(manifest, separators=(",", ":"), ensure_ascii=False),
+        encoding="utf-8",
+        newline="\n",
+    )
+    return manifest
+
+
 def validate() -> None:
     top_level = {path.name for path in ROOT.iterdir()}
     unexpected = top_level - ALLOWED_TOP_LEVEL
@@ -142,7 +186,13 @@ def validate() -> None:
         exported = ROOT / item["path"]
         if not exported.is_file():
             raise AssertionError(f"manifest file missing: {item['path']}")
-        digest = hashlib.sha256(exported.read_bytes()).hexdigest()
+        digest = _file_sha256(exported)
+        payload = _manifest_file_bytes(exported)
+        if len(payload) != int(item.get("bytes") or -1):
+            raise AssertionError(
+                f"manifest byte-length mismatch: {item['path']} "
+                f"(manifest={item.get('bytes')} lf={len(payload)})"
+            )
         if digest != item["sha256"]:
             raise AssertionError(f"manifest checksum mismatch: {item['path']}")
 
@@ -183,4 +233,16 @@ def validate() -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--rebuild-manifest",
+        action="store_true",
+        help="Rewrite public_bundle_manifest.json with LF-normalized hashes, then validate",
+    )
+    args = parser.parse_args()
+    if args.rebuild_manifest:
+        rebuild_public_bundle_manifest()
+        print("rewrote data/public_bundle_manifest.json")
     validate()
