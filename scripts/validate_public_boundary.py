@@ -14,6 +14,7 @@ ALLOWED_TOP_LEVEL = {
     ".github",
     ".gitignore",
     ".nojekyll",
+    ".wrangler",
     "AGENTS.md",
     "README.md",
     "assets",
@@ -90,7 +91,7 @@ def validate() -> None:
 
     seen: set[str] = set()
     for path in ROOT.rglob("*"):
-        if not path.is_file() or ".git" in path.parts:
+        if not path.is_file() or ".git" in path.parts or ".wrangler" in path.parts:
             continue
         rel = path.relative_to(ROOT).as_posix()
         seen.add(rel)
@@ -144,6 +145,39 @@ def validate() -> None:
         digest = hashlib.sha256(exported.read_bytes()).hexdigest()
         if digest != item["sha256"]:
             raise AssertionError(f"manifest checksum mismatch: {item['path']}")
+
+    metrics = json.loads((ROOT / "data/etf_metrics_daily.json").read_text(encoding="utf-8"))
+    metric_rows = metrics.get("rows") if isinstance(metrics, dict) else None
+    if not isinstance(metric_rows, list) or not metric_rows:
+        raise AssertionError("etf_metrics_daily.json has no rows")
+    metric_dates = [
+        str(row.get("date") or "")[:10]
+        for row in metric_rows
+        if isinstance(row, dict) and str(row.get("date") or "")[:10]
+    ]
+    if not metric_dates:
+        raise AssertionError("etf_metrics_daily.json has no dated rows")
+    metrics_latest = max(metric_dates)
+    adj_days = sum(
+        1
+        for row in metric_rows
+        if isinstance(row, dict)
+        and isinstance(row.get("etf_adj_close"), (int, float))
+        and float(row["etf_adj_close"]) > 0
+    )
+    if adj_days < max(1, int(len(metric_rows) * 0.5)):
+        raise AssertionError(
+            f"etf_metrics_daily.json missing etf_adj_close "
+            f"({adj_days}/{len(metric_rows)} positive)"
+        )
+
+    freshness = json.loads((ROOT / "data/freshness_summary.json").read_text(encoding="utf-8"))
+    claimed = str((freshness.get("metrics") or {}).get("latest_date") or "")[:10]
+    if claimed and claimed != metrics_latest:
+        raise AssertionError(
+            f"freshness_summary metrics.latest_date={claimed} "
+            f"does not match etf_metrics_daily max date={metrics_latest}"
+        )
 
     print(f"public boundary ok: {len(seen)} files")
 

@@ -4722,10 +4722,14 @@ function RealizedDecayHorizonsBarChart({ horizons, delta, borrowAnnual, etfLabel
             Number.isFinite(Number(borrowAnnual))
               ? `Borrow drag: ${fmt(Number(borrowAnnual) * (p.obs / 252))} over period`
               : null,
-            !p.sufficient ? '(partial window — history shorter than horizon)' : null,
+            !p.sufficient
+              ? (p.availableHistory
+                ? '(available history — listing shorter than longer horizons)'
+                : '(partial window — history shorter than horizon)')
+              : null,
           ].filter(Boolean).join('\n');
           return (
-            <div key={p.horizonDays} className="decay-horizon-col" title={tip}>
+            <div key={`${p.horizonDays}-${p.availableHistory ? 'avail' : 'full'}`} className="decay-horizon-col" title={tip}>
               <div style={{ display: 'flex', gap: 8, fontFamily: 'JetBrains Mono, monospace', fontSize: 10 }}>
                 <span style={{ color: Number(p.grossSimple) >= 0 ? 'var(--positive)' : 'var(--negative)' }}>
                   G {fmtPeriod(p.grossSimple)}
@@ -4738,7 +4742,9 @@ function RealizedDecayHorizonsBarChart({ horizons, delta, borrowAnnual, etfLabel
                 <MiniBar value={p.grossSimple} kind="gross" insufficient={!p.sufficient} />
                 <MiniBar value={p.netSimple} kind="net" insufficient={!p.sufficient} />
               </div>
-              <div className="decay-horizon-label">{p.horizonDays}d</div>
+              <div className="decay-horizon-label">
+                {p.availableHistory ? `${p.obs}d*` : `${p.horizonDays}d`}
+              </div>
             </div>
           );
         })}
@@ -7765,7 +7771,7 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
     const c = Number(getBorrowRate(r));
     return Number.isFinite(c) ? c : 0;
   }, [etfBorrowSeries, r]);
-  const realizedDecayHorizons = useMemo(() => (
+  const realizedDecayHorizonsRaw = useMemo(() => (
     typeof RealizedDecayFns.computeHorizonPeriodReturns === 'function'
       ? RealizedDecayFns.computeHorizonPeriodReturns(
         realizedDailyDragSeries,
@@ -7774,6 +7780,11 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
       )
       : { horizons: [], nDays: 0, endDate: null }
   ), [realizedDailyDragSeries, decayBorrowAnnual]);
+  const realizedDecayHorizons = useMemo(() => (
+    typeof RealizedDecayFns.collapsePartialHorizons === 'function'
+      ? RealizedDecayFns.collapsePartialHorizons(realizedDecayHorizonsRaw)
+      : realizedDecayHorizonsRaw
+  ), [realizedDecayHorizonsRaw]);
   const fofDecayHorizons = useMemo(() => {
     if (!isFoF || !fofRealizedPair?.ok) return null;
     const horizons = (fofRealizedPair.horizons || []).map((h) => ({
@@ -10364,8 +10375,13 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
                 </thead>
                 <tbody>
                   {(decayHorizonsDisplay.horizons || []).map((h) => (
-                    <tr key={`decay-h-${h.horizonDays}`}>
-                      <td>{h.horizonDays} trading days</td>
+                    <tr key={`decay-h-${h.horizonDays}-${h.availableHistory ? 'avail' : 'full'}`}>
+                      <td>
+                        {h.availableHistory
+                          ? `Available history (${h.obs}d)`
+                          : `${h.horizonDays} trading days`}
+                        {!h.sufficient && !h.availableHistory ? ' (partial)' : ''}
+                      </td>
                       <td style={{ color: h.grossSimple >= 0 ? 'var(--positive)' : 'var(--negative)', fontFamily: 'JetBrains Mono, monospace' }}>
                         {h.grossSimple != null && Number.isFinite(h.grossSimple) ? fmt(h.grossSimple) : '—'}
                       </td>
@@ -10475,8 +10491,13 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
                 </thead>
                 <tbody>
                   {(realizedDecayHorizons.horizons || []).map((h) => (
-                    <tr key={`decay-h-${h.horizonDays}`}>
-                      <td>{h.horizonDays} trading days</td>
+                    <tr key={`decay-h-${h.horizonDays}-${h.availableHistory ? 'avail' : 'full'}`}>
+                      <td>
+                        {h.availableHistory
+                          ? `Available history (${h.obs}d)`
+                          : `${h.horizonDays} trading days`}
+                        {!h.sufficient && !h.availableHistory ? ' (partial)' : ''}
+                      </td>
                       <td style={{ color: h.grossSimple >= 0 ? 'var(--positive)' : 'var(--negative)', fontFamily: 'JetBrains Mono, monospace' }}>
                         {h.grossSimple != null && Number.isFinite(h.grossSimple) ? fmt(h.grossSimple) : '—'}
                       </td>

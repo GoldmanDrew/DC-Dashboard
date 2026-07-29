@@ -1285,7 +1285,12 @@
     }
 
     let quality = "good";
-    if (unexplainedEtfJump.maxUnexplainedEtfLogReturn > 0.35 || droppedDays > bothLegDays * 0.1) quality = "degraded";
+    if (
+      unexplainedEtfJump.maxUnexplainedEtfLogReturn > 0.35
+      || droppedDays > bothLegDays * 0.1
+      || etfAdjDays < rawInputDays * 0.85
+      || undAdjDays < rawInputDays * 0.85
+    ) quality = "degraded";
     if (trJointDays < 20 || unexplainedEtfJump.maxUnexplainedEtfLogReturn > 0.75) quality = "poor";
 
     const primaryEtfBasis = (() => {

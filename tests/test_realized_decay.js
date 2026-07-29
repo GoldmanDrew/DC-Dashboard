@@ -18,6 +18,7 @@ const {
   cumSplitFactor,
   filterSplitsNeedingCloseBasisFix,
   summarizeTrCoverage,
+  collapsePartialHorizons,
 } = RD;
 
 function makeFlatSeries(n, etfDrift = 0, undDrift = 0) {
@@ -70,6 +71,16 @@ test("period gross equals endpoint log drag", () => {
   assert.ok(Math.abs(row.grossLog - endpoint) < 1e-9);
   assert.ok(Math.abs(row.etfStartPx - start.trEtfPx) < 1e-9);
   assert.ok(Math.abs(row.etfEndPx - end.trEtfPx) < 1e-9);
+});
+
+test("collapsePartialHorizons dedupes identical longer partials", () => {
+  const daily = buildDailyLogDragSeries(prepareDecayTrRows(makeFlatSeries(26, -0.002, 0.001), []), -2);
+  const raw = computeHorizonPeriodReturns(daily, [5, 20, 60, 120, 251], 0.1);
+  const collapsed = collapsePartialHorizons(raw);
+  const partials = collapsed.horizons.filter((h) => !h.sufficient);
+  assert.equal(partials.length, 1);
+  assert.equal(partials[0].availableHistory, true);
+  assert.ok(collapsed.horizons.filter((h) => h.sufficient).length >= 1);
 });
 
 test("rolling period series length", () => {
@@ -254,4 +265,20 @@ test("summarizeTrCoverage reports split mode and joint days", () => {
   assert.equal(cov.trJointDays, 2);
   assert.equal(cov.splitMode, "discrete_split");
   assert.ok(cov.primaryEtfBasis.includes("yahoo") || cov.primaryEtfBasis === "split_adjusted");
+});
+
+test("summarizeTrCoverage degrades quality when ETF adj is missing", () => {
+  const rows = [];
+  for (let i = 0; i < 25; i += 1) {
+    rows.push({
+      date: `2026-06-${String(i + 1).padStart(2, "0")}`,
+      close_price: 25 - i * 0.05,
+      nav: 25 - i * 0.05,
+      underlying_adj_close: 100 + i * 0.1,
+    });
+  }
+  const cov = summarizeTrCoverage(rows, []);
+  assert.equal(cov.etfAdjDays, 0);
+  assert.equal(cov.quality, "degraded");
+  assert.ok((cov.warnings || []).some((w) => /ETF Yahoo adj close missing/.test(w)));
 });
