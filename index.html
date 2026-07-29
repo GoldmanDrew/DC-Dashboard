@@ -1486,12 +1486,306 @@ const VRP_FIELD_DICT_URL = "data/vrp_field_dictionary.json";
 const YIELDBOOST_PUT_SPREADS_URL = "data/yieldboost_put_spreads_latest.json";
 
 function borrowSpikeBadge(r) {
-  const p = Number(r?.borrow_spike_p_5d);
-  const band = String(r?.borrow_spike_risk_band || '').toLowerCase();
-  if (!Number.isFinite(p) || r?.borrow_spike_scoring_eligible === false) return null;
-  if (band === 'high' || p >= 0.25) return { label: 'SPIKE', cls: 'badge-stale', title: `P(borrow spike 5d)=${fmt(p)} (${band || 'high'})` };
-  if (band === 'medium' || p >= 0.12) return { label: '↑', cls: 'badge-warn', title: `P(borrow spike 5d)=${fmt(p)}` };
+  const tier = String(r?.borrow_spike_alert_tier || r?.borrow_spike_risk_band || '').toLowerCase();
+  const pCal = Number(r?.borrow_spike_p_5d_l2_calibrated);
+  const p = Number.isFinite(pCal) ? pCal : Number(r?.borrow_spike_p_5d);
+  if (!Number.isFinite(p)) return null;
+  const thin = r?.borrow_spike_scoring_eligible === false
+    || String(r?.borrow_spike_quality_band || '').toLowerCase() === 'thin';
+  const qual = thin
+    ? ` · ${String(r?.borrow_spike_quality_band || 'thin')} history (diagnostic)`
+    : '';
+  const pLabel = Number.isFinite(pCal) ? 'L2 cal' : 'P(spike 5d)';
+  if (tier === 'high' || p >= 0.25) {
+    return { label: 'SPIKE', cls: 'badge-stale', title: `Borrow stress (${pLabel})=${fmt(p)} (${tier || 'high'})${qual}` };
+  }
+  if (tier === 'elevated' || tier === 'watch' || tier === 'medium' || p >= 0.12) {
+    return { label: '↑', cls: 'badge-warn', title: `Borrow stress (${pLabel})=${fmt(p)} (${tier || 'elevated'})${qual}` };
+  }
   return null;
+}
+
+function borrowModelDisagreeBadge(r) {
+  if (!r?.borrow_ops_model_disagree) return null;
+  const v2 = String(r?.borrow_ops_spike_tier_v2 || r?.borrow_spike_alert_tier || r?.borrow_spike_risk_band || '').toLowerCase();
+  const boost = String(r?.borrow_ops_spike_tier_boosting || r?.borrow_spike_alert_tier_boosting || '').toLowerCase();
+  return {
+    label: '≠',
+    cls: 'badge-warn',
+    title: `Borrow model disagree: v2=${v2 || '—'} vs boosting shadow=${boost || '—'} — review sizing`,
+  };
+}
+
+const BORROW_OUTLOOK_TIER_RANK = { high: 4, elevated: 3, watch: 2, medium: 2, low: 1 };
+
+function borrowOutlookFields(r) {
+  const level = getBorrowRate(r);
+  const delta = Number(r?.borrow_forecast_delta_5d_p50);
+  const forecastLevel = Number(r?.borrow_forecast_5d_p50);
+  const forecastMethod = String(r?.borrow_forecast_method || '').trim();
+  const boostTier = String(r?.borrow_spike_alert_tier_boosting || '').toLowerCase();
+  const tier = String(r?.borrow_spike_alert_tier || r?.borrow_spike_risk_band || '').toLowerCase();
+  const policy = String(r?.borrow_ops_policy || r?.borrow_model_spike_winner || '').trim();
+  const driftWinner = String(r?.borrow_model_drift_winner || '').trim();
+  const disagree = r?.borrow_ops_model_disagree === true;
+  const driftTight = r?.borrow_ops_drift_tightening === true;
+  const effP50 = Number(r?.borrow_ops_effective_net_edge_p50);
+  const pCal = Number(r?.borrow_spike_p_5d_l2_calibrated);
+  const pL0 = Number(r?.borrow_spike_p_5d);
+  const posterior = Number(r?.borrow_for_net_annual);
+  const eligible = r?.borrow_spike_scoring_eligible !== false;
+  const thin = !eligible || String(r?.borrow_spike_quality_band || '').toLowerCase() === 'thin'
+    || r?.borrow_history_thin === true;
+  return {
+    level: Number.isFinite(Number(level)) ? Number(level) : null,
+    delta: Number.isFinite(delta) ? delta : null,
+    forecastLevel: Number.isFinite(forecastLevel) ? forecastLevel : null,
+    forecastMethod: forecastMethod || null,
+    boostTier: boostTier || null,
+    tier,
+    policy: policy || null,
+    driftWinner: driftWinner || null,
+    disagree,
+    driftTight,
+    effP50: Number.isFinite(effP50) ? effP50 : null,
+    pCal: Number.isFinite(pCal) ? pCal : null,
+    pL0: Number.isFinite(pL0) ? pL0 : null,
+    posterior: Number.isFinite(posterior) ? posterior : null,
+    eligible,
+    thin,
+  };
+}
+
+function borrowOutlookStressRank(r) {
+  const { tier, delta, eligible } = borrowOutlookFields(r);
+  if (!eligible && !Number.isFinite(Number(r?.borrow_spike_p_5d))) return -1;
+  const tr = BORROW_OUTLOOK_TIER_RANK[tier] || 0;
+  // Under short_favorable_positive, fee-worsening drift is negative → invert for rank.
+  const d = Number.isFinite(delta) ? -delta : 0;
+  return tr * 1000 + d;
+}
+
+const fmtSignedPp = (v, digits = 1) => {
+  if (v == null || !Number.isFinite(Number(v))) return '—';
+  const n = Number(v) * 100;
+  const sign = n >= 0 ? '+' : '';
+  return `${sign}${n.toFixed(digits)}pp`;
+};
+
+/** short_favorable: more negative delta = fee rising = bad for short. */
+function borrowOutlookDriftCls(delta) {
+  if (!Number.isFinite(Number(delta))) return '';
+  if (Number(delta) < -0.02) return 'val-negative';
+  if (Number(delta) > 0.02) return 'val-positive';
+  return 'val-muted';
+}
+
+function borrowOutlookTierCls(tier) {
+  const t = String(tier || '').toLowerCase();
+  if (t === 'high') return 'val-negative';
+  if (t === 'elevated' || t === 'watch' || t === 'medium') return 'val-warning';
+  if (t === 'low') return 'val-positive';
+  return 'val-muted';
+}
+
+function borrowOutlookTooltip(r, display) {
+  const o = borrowOutlookFields(r);
+  const lines = [
+    'Borrow outlook (short_favorable_positive: negative = fee, positive = rebate).',
+    `Level (spot): ${o.level != null ? fmt(o.level) : '—'}`,
+  ];
+  if (display) lines.push(borrowSourceHint(display));
+  if (o.posterior != null) {
+    lines.push(`Net-edge borrow: ${fmt(o.posterior)}/yr${r?.borrow_resample_mode ? ` (${r.borrow_resample_mode})` : ''}`);
+  }
+  if (o.delta != null) {
+    lines.push(`Drift (5D p50): ${fmtSignedPp(o.delta)} → forecast ${o.forecastLevel != null ? fmt(o.forecastLevel) : '—'} (${o.forecastMethod || 'directional'})`);
+  }
+  if (o.pCal != null) {
+    lines.push(`Stress (L2 cal): ${fmt(o.pCal)} · tier ${o.tier || '—'}`);
+  } else if (o.pL0 != null) {
+    lines.push(`Stress (v1 P_spike_5d): ${fmt(o.pL0)} · tier ${o.tier || '—'}${o.thin ? ' · thin history (diagnostic)' : ''}`);
+  } else if (o.thin) {
+    lines.push('Stress: thin Clear Street history — spike score is diagnostic only.');
+  }
+  if (o.boostTier && o.boostTier !== o.tier) {
+    lines.push(`Boosting shadow tier: ${o.boostTier.toUpperCase()} (diagnostic)`);
+  }
+  if (o.disagree) {
+    lines.push(`Model disagree: v2 tier ${o.tier || '—'} vs boosting ${o.boostTier || '—'} — review sizing.`);
+  }
+  return lines.join('\n');
+}
+
+function borrowOutlookSublabel(r) {
+  const o = borrowOutlookFields(r);
+  const parts = [];
+  if (o.delta != null) parts.push(`${fmtSignedPp(o.delta)} est`);
+  if (o.tier && o.tier !== 'low' && o.tier !== 'unknown') {
+    parts.push(o.tier.toUpperCase());
+  }
+  if (o.thin) parts.push('thin');
+  if (o.disagree) parts.push('≠');
+  return parts.length ? parts.join(' · ') : 'stable';
+}
+
+function borrowOutlookNetEdgeNotes(r) {
+  const o = borrowOutlookFields(r);
+  const lines = [];
+  const mode = (r?.borrow_resample_mode || '').trim();
+  if (o.posterior != null) {
+    lines.push(`Net edge uses borrow ≈ ${fmt(o.posterior)}/yr${mode ? ` (${mode}${r?.borrow_weight_halflife_days ? `, ${Math.round(Number(r.borrow_weight_halflife_days))}d halflife` : ''})` : ''}.`);
+  } else if (o.level != null) {
+    lines.push(`Net edge uses spot borrow ${fmt(o.level)} (short_favorable_positive).`);
+  }
+  if (o.thin) {
+    lines.push('Thin Clear Street borrow history — net edge is point-in-time, not a resampled borrow distribution.');
+  }
+  if (o.effP50 != null && (o.tier === 'elevated' || o.tier === 'high')) {
+    const headline = Number(r?.net_edge_p50_annual);
+    if (Number.isFinite(headline) && o.effP50 < headline - 1e-6) {
+      lines.push(`Sizing uses effective net edge ${fmtLogYr(o.effP50)} (min of p50 and stress) — headline p50 ${fmtLogYr(headline)} unchanged.`);
+    }
+  }
+  if (o.disagree) {
+    lines.push('Borrow models disagree on spike tier — review sizing; v2 tier still drives alerts when present.');
+  }
+  if (o.delta != null && o.delta < -0.02 && (o.tier === 'elevated' || o.tier === 'high')) {
+    lines.push('Borrow stress elevated with fee-worsening drift — p50 may understate carry if borrow tightens further.');
+  } else if (o.delta != null && o.delta > 0.02) {
+    lines.push('Borrow easing (short-favorable) — spot may overstate long-run fee vs posterior.');
+  } else if (o.tier === 'elevated' || o.tier === 'high') {
+    lines.push('Elevated borrow stress tier — monitor sizing.');
+  }
+  const stressP50 = Number(r?.net_edge_stress_p50_annual);
+  const stressBorrow = Number(r?.borrow_stress_borrow_annual);
+  if (Number.isFinite(stressP50) && (o.tier === 'elevated' || o.tier === 'high')) {
+    lines.push(`Stress-case net edge p50: ${fmtLogYr(stressP50)} (if borrow → ${Number.isFinite(stressBorrow) ? fmt(stressBorrow) : 'forecast'}/yr).`);
+  }
+  return lines;
+}
+
+function BorrowOutlookCell({ r, borrowHistoryMap, dashboardBuildTime }) {
+  const display = borrowDisplay(r, borrowHistoryMap?.[r?.symbol], { dashboardBuildTime });
+  const o = borrowOutlookFields(r);
+  const sb = borrowSpikeBadge(r);
+  const db = borrowModelDisagreeBadge(r);
+  const sub = borrowOutlookSublabel(r);
+  return (
+    <div title={borrowOutlookTooltip(r, display)}>
+      <div className={cls('net-edge-merged-p50', borrowCls(o.level))} style={{ fontSize: 13 }}>
+        {o.level != null ? fmt(o.level) : '—'}
+        {borrowBadge(o.level)}
+        {sb ? <span className={cls('badge', sb.cls)} style={{ marginLeft: 4, fontSize: 9 }} title={sb.title}>{sb.label}</span> : null}
+        {db ? <span className={cls('badge', db.cls)} style={{ marginLeft: 4, fontSize: 9 }} title={db.title}>{db.label}</span> : null}
+      </div>
+      <div className="col-sublabel" style={{ fontSize: 10, marginTop: 2 }}>
+        <span className={borrowOutlookDriftCls(o.delta)}>{sub}</span>
+      </div>
+    </div>
+  );
+}
+
+function BorrowOutlookCard({
+  r,
+  borrowSpikeRisk,
+  borrowHistoryStats,
+  spikeReplayMetrics,
+  spikeReplayWindow,
+  spikeFindings,
+  spikeTracking,
+  borrowSpikeEvalError,
+  borrowSpikeRiskMeta,
+  loading,
+  error,
+}) {
+  const o = borrowOutlookFields(r);
+  const spike = borrowSpikeRisk || {};
+  const probCal = Number.isFinite(o.pCal) ? o.pCal : null;
+  const probShow = Number.isFinite(probCal) ? probCal : (Number.isFinite(o.pL0) ? o.pL0 : Number(spike.p_spike_5d));
+  const tier = o.tier || String(spike.alert_tier || spike.risk_band || 'unknown').toLowerCase();
+  const minObs = Number(borrowSpikeRiskMeta?.quality_gate?.min_obs_for_scoring) || 30;
+  const blocked = (spikeTracking?.milestones || []).filter((m) => m.status === 'blocked');
+  const histPts = Number(spike.history_points);
+  return (
+    <div className="trade-card" style={{ marginTop: 10 }}>
+      <div className="trade-head">
+        <div>
+          <div className="scenario-title">Borrow Outlook</div>
+          <div className="scenario-sub">Level · net-edge borrow · stress (v1{Number.isFinite(probCal) ? ' + L2' : ''})</div>
+        </div>
+      </div>
+      {loading ? (
+        <div className="scenario-warning">Loading borrow outlook…</div>
+      ) : error ? (
+        <div className="scenario-warning">{error}</div>
+      ) : o.thin ? (
+        <div className="scenario-warning">
+          Thin Clear Street history{Number.isFinite(histPts) ? ` (${fmtNum(histPts)} prints)` : ''}
+          {` — stress is diagnostic until ≥${fmtNum(minObs)} prints for production scoring.`}
+        </div>
+      ) : null}
+      <div className="chart-stats">
+        <div className="stat-pill">
+          <div className="k">Level (spot)</div>
+          <div className={cls('v', borrowCls(o.level))}>{o.level != null ? fmt(o.level) : '—'}</div>
+        </div>
+        <div className="stat-pill">
+          <div className="k">Net-edge borrow</div>
+          <div className={cls('v', borrowCls(o.posterior))}>{o.posterior != null ? fmt(o.posterior) : '—'}</div>
+        </div>
+      </div>
+      <div className="chart-stats" style={{ marginTop: 8 }}>
+        <div className="stat-pill">
+          <div className="k">Δborrow 5D</div>
+          <div className={cls('v', borrowOutlookDriftCls(o.delta))}>{fmtSignedPp(o.delta)}</div>
+        </div>
+        <div className="stat-pill">
+          <div className="k">Forecast 5D</div>
+          <div className="v">{o.forecastLevel != null ? fmt(o.forecastLevel) : '—'}</div>
+        </div>
+      </div>
+      <div className="chart-stats" style={{ marginTop: 8 }}>
+        <div className="stat-pill">
+          <div className="k">Stress tier</div>
+          <div className={cls('v', borrowOutlookTierCls(tier))}>{tier ? tier.toUpperCase() : '—'}</div>
+        </div>
+        <div className="stat-pill">
+          <div className="k">{Number.isFinite(probCal) ? 'L2 calibrated' : 'P_spike_5d'}</div>
+          <div className={cls('v', borrowOutlookTierCls(tier))}>{Number.isFinite(probShow) ? fmt(probShow) : '—'}</div>
+        </div>
+      </div>
+      {borrowHistoryStats?.avg != null && (
+        <div className="borrow-meta" style={{ marginTop: 8 }}>
+          History avg {fmt(borrowHistoryStats.avg)} · median 60d {Number.isFinite(Number(r?.borrow_median_60d)) ? fmt(Number(r.borrow_median_60d)) : '—'}
+          {r?.borrow_resample_mode ? ` · resample ${r.borrow_resample_mode}` : ''}
+        </div>
+      )}
+      {spikeFindings?.best_estimate_borrow && (
+        <div className="borrow-meta" style={{ marginTop: 6 }}>
+          <strong>Summary:</strong> {spikeFindings.best_estimate_borrow}
+        </div>
+      )}
+      <details style={{ marginTop: 8, fontSize: 11, color: 'var(--text-muted)' }}>
+        <summary style={{ cursor: 'pointer' }}>Model diagnostics</summary>
+        <div style={{ marginTop: 6 }}>
+          L0 P(spike): {Number.isFinite(o.pL0) ? fmt(o.pL0) : '—'}
+          {Number.isFinite(probCal) ? <> · L2 cal {fmt(probCal)}</> : null}
+          {spikeReplayMetrics?.status === 'ok' ? (
+            <>
+              {' '}· Replay AUROC {Number(spikeReplayMetrics.auroc).toFixed(3)}
+              {' '}({spikeReplayWindow?.start || '—'} → {spikeReplayWindow?.end || '—'})
+            </>
+          ) : borrowSpikeEvalError ? (
+            <> · Eval: {borrowSpikeEvalError}</>
+          ) : (
+            <> · Replay eval pending (L2/forecast producers not wired yet)</>
+          )}
+          {blocked.length ? <> · Tracking: {blocked.length} blocked milestone(s)</> : null}
+        </div>
+      </details>
+    </div>
+  );
 }
 
 function mocFlowHeadline(r) {
@@ -2830,11 +3124,14 @@ function DashboardRoot() {
   );
 }
 
+/** short_favorable_positive: negative = fee (bad for short) → red; positive = rebate → green. */
 const borrowCls = v => {
-  if (v == null) return 'val-muted';
-  if (v > 0.15) return 'val-negative';
-  if (v > 0.08) return 'val-warning';
-  return 'val-positive';
+  if (v == null || !Number.isFinite(Number(v))) return 'val-muted';
+  const x = Number(v);
+  if (x < -0.15) return 'val-negative';
+  if (x < -0.08) return 'val-warning';
+  if (x > 0.02) return 'val-positive';
+  return 'val-muted';
 };
 const spreadCls = v => {
   if (v == null) return 'val-muted';
@@ -3873,10 +4170,12 @@ function FoFLongHolderReturnChart({ r, allRecords, chartVolLookbackRange }) {
     </div>
   );
 }
+/** short_favorable_positive: negative = fee (HIGH/MED), positive = rebate. */
 const borrowBadge = v => {
-  if (v == null) return null;
-  if (v > 0.15) return <span className="badge badge-bad">HIGH</span>;
-  if (v > 0.08) return <span className="badge badge-warn">MED</span>;
+  if (v == null || !Number.isFinite(Number(v))) return null;
+  const x = Number(v);
+  if (x < -0.15) return <span className="badge badge-bad">HIGH</span>;
+  if (x < -0.08) return <span className="badge badge-warn">MED</span>;
   return null;
 };
 
@@ -4459,7 +4758,7 @@ const COLS = [
   { key: 'symbol', label: 'Symbol', w: 100, hint: 'BL = strategy blacklist (shown for context; not sized in trade plan / rebalancer).' },
   { key: 'underlying', label: 'Underlying', w: 85 },
   { key: 'delta', label: 'Delta', w: 65, hint: 'ls-algo hedge δ: OLS on aligned daily simple returns vs underlying TR, shrunk toward listed leverage (AR(1)-adjusted n_eff).' },
-  { key: 'borrow_current', label: 'Borrow Rate', w: 105, hint: 'Spot fee-only borrow on this row (Clear Street on full build, else screener CSV). Compare to borrow_history.json tail on chart Borrow tab.' },
+  { key: 'borrow_current', label: 'Borrow', w: 118, sublabel: 'spot · outlook', hint: 'Borrow outlook: spot Clear Street rate (short_favorable_positive: negative = fee). Sublabel = stress tier / thin-history / 5D drift when present. HIGH/MED = fee magnitude; SPIKE/↑ = v1 (or L2) stress.' },
   { key: 'shares_available', label: 'Shares Avail', w: 100, hint: 'IBKR shares available imported as an availability-only proxy. This is not a borrow-rate source.' },
   { key: 'gross_decay_annual', label: 'Gross (realiz.)', w: 100, sublabel: 'trailing', hint: 'Realized: trailing annualized hedge drag from ls-algo screener (δ·r_U − r_ETF) × 252. Not the forward Exp. edge (fwd) column.' },
   { key: 'expected_pair_pnl_p50_annual', label: 'Exp. edge (fwd)', sublabel: 'struct · 1Y log/yr', w: 128, hint: 'Forward structural gross decay before borrow (log/yr). YieldBOOST: screener put-spread MC — same anchor as Net edge and Scenarios heatmap. LETF/inverse/vol-ETP: vol-drag identity. Sub-row: p10/p90 band. Hover for vol sensitivity and weekly pair MC diagnostic.' },
@@ -4979,10 +5278,28 @@ function DetailRow({ r, chartVolLookbackRange, dashboardBuildTime, metricsCacheT
     <tr className="detail-row">
       <td colSpan={COLS.length + 1}>
         <div className="detail-grid">
-          <div className="detail-item" title={borrowSourceHint(borrowDisplay(r, borrowHistoryMap?.[r.symbol], { dashboardBuildTime }))}>
-            <div className="dlabel">Borrow (spot, fee-only)</div>
-            <div className={cls('dval', borrowCls(getBorrowRate(r)))}>{fmt(getBorrowRate(r))}</div>
-            <div className="detail-item-hint">{r.borrow_source === 'clearstreet' ? 'Clear Street · realized snapshot' : 'Clear Street rate unavailable'}</div>
+          <div className="detail-item" title={borrowOutlookTooltip(r, borrowDisplay(r, borrowHistoryMap?.[r.symbol], { dashboardBuildTime }))}>
+            <div className="dlabel">Borrow (spot)</div>
+            <div className={cls('dval', borrowCls(getBorrowRate(r)))}>{fmt(getBorrowRate(r))} {borrowBadge(getBorrowRate(r))}</div>
+            <div className="detail-item-hint">
+              short_favorable_positive (neg = fee)
+              {borrowOutlookNetEdgeNotes(r).length ? (
+                <>
+                  <br />
+                  {borrowOutlookNetEdgeNotes(r)[0]}
+                </>
+              ) : null}
+            </div>
+          </div>
+          <div className="detail-item">
+            <div className="dlabel">Net-edge borrow</div>
+            <div className={cls('dval', borrowCls(Number(r.borrow_for_net_annual)))}>
+              {Number.isFinite(Number(r.borrow_for_net_annual)) ? fmt(Number(r.borrow_for_net_annual)) : '—'}
+            </div>
+            <div className="detail-item-hint">
+              {r.borrow_resample_mode || 'point_in_time'}
+              {r.borrow_history_thin ? ' · thin history' : ''}
+            </div>
           </div>
           <div className="detail-item">
             <div className="dlabel">Borrow (hist. avg)</div>
@@ -7698,7 +8015,7 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
     : (Number.isFinite(Number(r.borrow_avg_annual))
       ? Number(r.borrow_avg_annual)
       : Number(getBorrowRate(r)));
-  const annualCarryDrag = Number.isFinite(annualCarryDragRaw) ? Math.max(0, annualCarryDragRaw) : 0;
+  const annualCarryDrag = Number.isFinite(annualCarryDragRaw) ? Math.max(0, -annualCarryDragRaw) : 0;
   const borrowDisp = useMemo(
     () => borrowDisplay(r, etfBorrowSeries, { dashboardBuildTime }),
     [r, etfBorrowSeries, dashboardBuildTime],
@@ -11214,52 +11531,22 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
                   series={etfBorrowSeries}
                   valueKey="borrow_current"
                   color="rgba(245,158,11,0.95)"
-                  label="Borrow rate (annual, fee-only)"
+                  label="Borrow rate (annual, short_favorable_positive)"
                   formatValue={(v) => fmt(v)}
                   zeroLabel="0% borrow"
+                  referenceValue={Number.isFinite(Number(r?.borrow_forecast_5d_p50)) ? Number(r.borrow_forecast_5d_p50) : null}
+                  referenceLabel="5D forecast"
                 />
               )}
               {!borrowHistoryLoading && !borrowHistoryError && (
-                <div className="trade-card" style={{ marginTop: 10 }}>
-                  <div className="trade-head">
-                    <div className="scenario-title">Spike Risk (5D)</div>
-                    <div className="scenario-sub">P(jump in borrow, 5D)</div>
-                  </div>
-                  {borrowSpikeRiskLoading ? (
-                    <div className="scenario-warning">Loading spike risk…</div>
-                  ) : borrowSpikeRiskError ? (
-                    <div className="scenario-warning">{borrowSpikeRiskError}</div>
-                  ) : etfSpikeRisk?.scoring_eligible === false ? (
-                    <div className="scenario-warning">
-                      Spike model needs ≥{fmtNum(Number(borrowSpikeRiskMeta?.quality_gate?.min_obs_for_scoring) || 30)} borrow prints — not enough yet.
-                    </div>
-                  ) : !Number.isFinite(etfSpikeProb) ? (
-                    <div className="scenario-warning">Spike risk not available for this symbol yet.</div>
-                  ) : (
-                    <>
-                      <div className="chart-stats">
-                        <div className="stat-pill">
-                          <div className="k">P_spike_5d</div>
-                          <div className={cls('v', etfSpikeBandCls)}>{fmt(etfSpikeProb)}</div>
-                        </div>
-                        <div className="stat-pill">
-                          <div className="k">Risk Band</div>
-                          <div className={cls('v', etfSpikeBandCls)}>{etfSpikeBand.toUpperCase()}</div>
-                        </div>
-                      </div>
-                      <div className="chart-stats" style={{ marginTop: 8 }}>
-                        <div className="stat-pill">
-                          <div className="k">Data Quality</div>
-                          <div className={cls('v', etfSpikeQualityCls)}>{etfSpikeQualityBand.toUpperCase()}</div>
-                        </div>
-                        <div className="stat-pill">
-                          <div className="k">Brier Score</div>
-                          <div className="v">{Number.isFinite(Number(spikeAccuracy?.brier_score)) ? Number(spikeAccuracy.brier_score).toFixed(4) : '—'}</div>
-                        </div>
-                      </div>
-                    </>
-                  )}
-                </div>
+                <BorrowOutlookCard
+                  r={r}
+                  borrowSpikeRisk={etfSpikeRisk}
+                  borrowHistoryStats={avgBorrowFromHistoryStats}
+                  borrowSpikeRiskMeta={borrowSpikeRiskMeta}
+                  loading={borrowSpikeRiskLoading}
+                  error={borrowSpikeRiskError}
+                />
               )}
             </div>
 
@@ -14219,12 +14506,12 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
                           {isYieldBoostFoF(r) ? fofUnderlyingDisplayLabel(r) : r.underlying}
                         </td>
                         <td>{r.delta?.toFixed(2) ?? '—'}</td>
-                        <td className={borrowCls(getBorrowRate(r))} title={borrowSourceHint(borrowDisplay(r, borrowHistoryMap?.[r.symbol], { dashboardBuildTime: data.build_time }))}>
-                          {fmt(getBorrowRate(r))} {borrowBadge(getBorrowRate(r))}
-                          {(() => {
-                            const sb = borrowSpikeBadge(r);
-                            return sb ? <span className={cls('badge', sb.cls)} style={{ marginLeft: 6, fontSize: 9 }} title={sb.title}>{sb.label}</span> : null;
-                          })()}
+                        <td title={borrowOutlookTooltip(r, borrowDisplay(r, borrowHistoryMap?.[r.symbol], { dashboardBuildTime: data.build_time }))}>
+                          <BorrowOutlookCell
+                            r={r}
+                            borrowHistoryMap={borrowHistoryMap}
+                            dashboardBuildTime={data.build_time}
+                          />
                         </td>
                         <td>{fmtSharesAvail(r.shares_available)}</td>
                         <td title="Realized trailing hedge drag (ls-algo screener)">{fmtGrossRealizedLog(r, r.gross_decay_annual)}</td>
