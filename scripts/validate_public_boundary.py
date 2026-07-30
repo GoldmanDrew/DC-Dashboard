@@ -70,6 +70,43 @@ REQUIRED_FILES = {
 }
 
 
+def _assert_borrow_sign_convention(payload: dict) -> None:
+    """Fail closed on HTB-as-rebate / spot-vs-avg polarity clashes.
+
+    Mirrors Diamond-Creek-Execution ``export_public_dashboard._assert_borrow_sign_convention``
+    so Pages deploys cannot ship a flipped Olympus publish even if CI bypasses the exporter.
+    """
+    records = payload.get("records")
+    if not isinstance(records, list):
+        return
+    bad: list[str] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        sym = str(rec.get("symbol") or "").strip().upper()
+        try:
+            spot = float(rec["borrow_current"]) if rec.get("borrow_current") is not None else None
+        except (TypeError, ValueError):
+            spot = None
+        try:
+            avg = float(rec["borrow_avg_annual"]) if rec.get("borrow_avg_annual") is not None else None
+        except (TypeError, ValueError):
+            avg = None
+        if spot is None:
+            continue
+        if spot > 0.50:
+            bad.append(f"{sym}:borrow_current={spot:.4f}>0.50")
+            continue
+        if spot > 0.15 and avg is not None and avg < -0.15:
+            bad.append(f"{sym}:spot={spot:.4f}/avg={avg:.4f}")
+    if bad:
+        raise AssertionError(
+            "borrow sign convention check failed (short_favorable_positive): "
+            + "; ".join(bad[:12])
+            + (f" (+{len(bad) - 12} more)" if len(bad) > 12 else "")
+        )
+
+
 def _walk_json(value: object, rel: str) -> None:
     stack = [value]
     while stack:
@@ -163,6 +200,7 @@ def validate() -> None:
         raise AssertionError("dashboard_data.json was not sanitized for DC-Dashboard")
     if "last_commit" in dashboard:
         raise AssertionError("private commit metadata leaked into dashboard_data.json")
+    _assert_borrow_sign_convention(dashboard)
 
     investors = json.loads((ROOT / "data/investors.json").read_text(encoding="utf-8"))
     users = investors.get("users")
