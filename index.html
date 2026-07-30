@@ -326,6 +326,8 @@
   .ipo-unlock-extra {
     margin-top: 5px;
     font-size: 11px; color: var(--text-secondary);
+    font-family: 'JetBrains Mono', monospace;
+  }
 
   /* Net edge visual grammar (table fan + expand charts — same colors) */
   .net-edge-merged {
@@ -1583,7 +1585,7 @@ function borrowOutlookFields(r) {
   const thin = !eligible || String(r?.borrow_spike_quality_band || '').toLowerCase() === 'thin'
     || r?.borrow_history_thin === true;
   return {
-    level: Number.isFinite(Number(level)) ? Number(level) : null,
+    level: numOrNull(level),
     delta: Number.isFinite(delta) ? delta : null,
     forecastLevel: Number.isFinite(forecastLevel) ? forecastLevel : null,
     forecastMethod: forecastMethod || null,
@@ -2028,6 +2030,14 @@ function isIssuerEarlyMetricsRow(row) {
 }
 
 // ── Formatters ──────────────────────────────
+/** Finite number, or null. Guards the `Number(null) === 0` trap: borrow fields
+ *  are present-but-null when a rate is unavailable, so a bare
+ *  `Number.isFinite(Number(v))` check turns "no data" into a real 0.00%. */
+const numOrNull = v => {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
 const fmt = v => v == null ? '—' : (v * 100).toFixed(2) + '%';
 const fmtNum = v => v == null ? '—' : Number(v).toLocaleString();
 /** Continuous-compounding annual log-rate, signed, 2 decimals. e.g. +1.20. */
@@ -2642,16 +2652,16 @@ function borrowHistoryTailPoint(series) {
   const rows = Array.isArray(series) ? series : [];
   if (!rows.length) return null;
   const last = rows[rows.length - 1];
-  const rate = Number(last?.borrow_current);
-  if (!Number.isFinite(rate)) return null;
+  const rate = numOrNull(last?.borrow_current);
+  if (rate == null) return null;
   return { date: String(last?.date || '').trim() || null, rate };
 }
 
 function borrowDisplay(r, borrowSeries, opts = {}) {
-  const spot = Number(getBorrowRate(r));
+  const spot = numOrNull(getBorrowRate(r));
   const tail = borrowHistoryTailPoint(borrowSeries);
   const tailRate = tail?.rate;
-  const spotOk = Number.isFinite(spot);
+  const spotOk = spot != null;
   const tailOk = Number.isFinite(tailRate);
   const differs = spotOk && tailOk && Math.abs(spot - tailRate) > 0.005;
   return {
@@ -2659,7 +2669,7 @@ function borrowDisplay(r, borrowSeries, opts = {}) {
     tailRate: tailOk ? tailRate : null,
     tailDate: tail?.date || null,
     source: r?.borrow_source || 'csv',
-    avg: Number.isFinite(Number(r?.borrow_avg_annual)) ? Number(r.borrow_avg_annual) : null,
+    avg: numOrNull(r?.borrow_avg_annual),
     differs,
     dashboardBuildTime: opts.dashboardBuildTime || null,
     historyBuildTime: opts.historyBuildTime || BORROW_HISTORY_BUILD_TIME || null,
@@ -2925,10 +2935,9 @@ const getBorrowRate = r => (r?.borrow_current ?? r?.borrow_net_annual ?? null);
 /** Signed borrow for table display (no clipping). */
 function signedBorrowForRecord(r) {
   if (!r) return null;
-  const avg = Number(r.borrow_avg_annual);
-  if (Number.isFinite(avg)) return avg;
-  const spot = Number(getBorrowRate(r));
-  return Number.isFinite(spot) ? spot : null;
+  const avg = numOrNull(r.borrow_avg_annual);
+  if (avg != null) return avg;
+  return numOrNull(getBorrowRate(r));
 }
 /** Non-negative borrow for carry-drag / backtest paths only. */
 function annualBorrowForRecord(r) {
