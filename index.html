@@ -281,6 +281,52 @@
     margin-top: 10px; padding-top: 14px; border-top: 1px solid var(--border);
   }
 
+
+  /* IPO float unlock strip (DetailRow + Stats) */
+  .ipo-unlock-strip {
+    border-left: 3px solid var(--accent-amber);
+    background: rgba(245, 158, 11, 0.06);
+    border-top: 1px solid rgba(245, 158, 11, 0.18);
+    border-right: 1px solid rgba(245, 158, 11, 0.12);
+    border-bottom: 1px solid rgba(245, 158, 11, 0.12);
+    border-radius: 0 6px 6px 0;
+    padding: 8px 12px 9px;
+    margin-bottom: 12px;
+  }
+  .ipo-unlock-strip.ipo-unlock-stats { margin-bottom: 10px; }
+  .ipo-unlock-head {
+    display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 10px;
+    margin-bottom: 6px;
+  }
+  .ipo-unlock-title {
+    font-size: 12px; font-weight: 700; color: var(--accent-amber);
+    letter-spacing: 0.2px;
+  }
+  .ipo-unlock-meta {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; color: var(--text-secondary);
+  }
+  .ipo-unlock-metrics {
+    display: flex; flex-wrap: wrap; gap: 10px 22px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .ipo-unlock-metric { min-width: 0; }
+  .ipo-unlock-metric .ium-label {
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--text-muted); margin-bottom: 1px;
+  }
+  .ipo-unlock-metric .ium-value {
+    font-size: 13px; font-weight: 700; color: var(--text-primary);
+  }
+  .ipo-unlock-foot {
+    margin-top: 5px;
+    font-size: 10px; color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .ipo-unlock-extra {
+    margin-top: 5px;
+    font-size: 11px; color: var(--text-secondary);
+
   /* Net edge visual grammar (table fan + expand charts — same colors) */
   .net-edge-merged {
     display: flex; flex-direction: column; align-items: stretch; gap: 5px; min-width: 0;
@@ -5228,6 +5274,98 @@ function EdgeFactsStrip({ r }) {
   );
 }
 
+
+/** Compact IPO float-unlock overlay (DetailRow + Stats). Not a headline replacement. */
+function formatIpoUnlockDateShort(iso) {
+  if (!iso) return null;
+  const d = new Date(`${String(iso).slice(0, 10)}T12:00:00`);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function IpoUnlockStrip({ r, density = 'compact' }) {
+  if (!r?.is_ipo_float_unlock) return null;
+  const days = r.days_to_next_ipo_unlock;
+  const dateShort = formatIpoUnlockDateShort(r.next_ipo_unlock_date);
+  const sharesM = r.next_ipo_unlock_shares != null && Number.isFinite(Number(r.next_ipo_unlock_shares))
+    ? `${(Number(r.next_ipo_unlock_shares) / 1e6).toFixed(1)}M sh`
+    : null;
+  const grade = r.ipo_unlock_data_grade ? `grade ${r.ipo_unlock_data_grade}` : null;
+  const metaBits = [dateShort, sharesM, grade].filter(Boolean);
+  const sigmaBase = r.forecast_vol_unlock_base_annual != null
+    ? r.forecast_vol_unlock_base_annual
+    : r.forecast_vol_underlying_annual;
+  const sigmaUnlock = r.forecast_vol_unlock_annual;
+  const sigmaTxt = (sigmaBase != null || sigmaUnlock != null)
+    ? `${sigmaBase != null ? fmt(sigmaBase) : '—'} → ${sigmaUnlock != null ? fmt(sigmaUnlock) : '—'}`
+    : '—';
+  const expUnlock = r.expected_gross_decay_unlock_p50_annual;
+  const tip = [
+    r.ipo_unlock_model_note || null,
+    r.next_ipo_unlock_date ? `Next: ${r.next_ipo_unlock_date}` : null,
+    r.next_ipo_unlock_shares != null ? `Shares: ${Number(r.next_ipo_unlock_shares).toLocaleString()}` : null,
+    density === 'compact' && r.net_edge_unlock_p50_annual != null
+      ? `Net edge unlock: ${fmtLogYr(r.net_edge_unlock_p50_annual)}`
+      : null,
+    density === 'compact' && r.price_car_unlock_p50_short_favorable != null
+      ? `CAR short-fav: ${fmt(r.price_car_unlock_p50_short_favorable)}`
+      : null,
+  ].filter(Boolean).join(' · ');
+  const showStatsExtra = density === 'stats';
+  return (
+    <div
+      className={cls('ipo-unlock-strip', showStatsExtra && 'ipo-unlock-stats')}
+      title={tip || undefined}
+      aria-label="IPO float unlock overlay"
+    >
+      <div className="ipo-unlock-head">
+        <span className="ipo-unlock-title">
+          IPO unlock{days != null && Number.isFinite(Number(days)) ? ` · ${Number(days)}d` : ''}
+        </span>
+        {metaBits.length > 0 ? (
+          <span className="ipo-unlock-meta">{metaBits.join(' · ')}</span>
+        ) : null}
+      </div>
+      <div className="ipo-unlock-metrics">
+        <div className="ipo-unlock-metric">
+          <div className="ium-label">σ base → unlock</div>
+          <div className="ium-value">{sigmaTxt}</div>
+        </div>
+        <div className="ipo-unlock-metric">
+          <div className="ium-label">Exp. decay unlock</div>
+          <div className="ium-value">{expUnlock != null ? fmtLogYr(expUnlock) : '—'}</div>
+        </div>
+        {showStatsExtra ? (
+          <div className="ipo-unlock-metric">
+            <div className="ium-label">Net edge unlock</div>
+            <div className="ium-value">
+              {r.net_edge_unlock_p50_annual != null ? fmtLogYr(r.net_edge_unlock_p50_annual) : '—'}
+            </div>
+          </div>
+        ) : null}
+      </div>
+      {showStatsExtra && (r.price_car_unlock_p50_short_favorable != null
+        || r.forecast_vol_unlock_event_annual != null
+        || r.forecast_vol_unlock_steady_annual != null) ? (
+        <div className="ipo-unlock-extra">
+          {r.price_car_unlock_p50_short_favorable != null
+            ? <>CAR short-fav {fmt(r.price_car_unlock_p50_short_favorable)}</>
+            : null}
+          {r.forecast_vol_unlock_event_annual != null || r.forecast_vol_unlock_steady_annual != null ? (
+            <>
+              {r.price_car_unlock_p50_short_favorable != null ? ' · ' : null}
+              event {r.forecast_vol_unlock_event_annual != null ? fmt(r.forecast_vol_unlock_event_annual) : '—'}
+              {' · ss '}
+              {r.forecast_vol_unlock_steady_annual != null ? fmt(r.forecast_vol_unlock_steady_annual) : '—'}
+            </>
+          ) : null}
+        </div>
+      ) : null}
+      <div className="ipo-unlock-foot">overlay · does not replace Exp. edge / Net edge</div>
+    </div>
+  );
+}
+
 function NetEdgeQuantileTable({ r }) {
   const rows = [
     ['p05', r.net_edge_p05_annual],
@@ -5283,6 +5421,7 @@ function DetailRow({ r, chartVolLookbackRange, dashboardBuildTime, metricsCacheT
   return (
     <tr className="detail-row">
       <td colSpan={COLS.length + 1}>
+        <IpoUnlockStrip r={r} density="compact" />
         <div className="detail-grid">
           <div className="detail-item" title={borrowOutlookTooltip(r, borrowDisplay(r, borrowHistoryMap?.[r.symbol], { dashboardBuildTime }))}>
             <div className="dlabel">Borrow (spot)</div>
@@ -9023,6 +9162,7 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
 
       {activePanel === 'stats' && (
         <div className="chart-section">
+          <IpoUnlockStrip r={r} density="stats" />
           {isFoF ? (
             <FoFStatsPanel r={r} borrowDisp={borrowDisp} chartVolLookbackRange={chartVolLookbackRange} />
           ) : (

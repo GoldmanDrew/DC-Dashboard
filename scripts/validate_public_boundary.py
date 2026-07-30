@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MAX_FILE_BYTES = 40 * 1024 * 1024
 ALLOWED_TOP_LEVEL = {
+    ".claude",
     ".git",
     ".github",
     ".gitignore",
@@ -172,7 +173,12 @@ def validate() -> None:
 
     seen: set[str] = set()
     for path in ROOT.rglob("*"):
-        if not path.is_file() or ".git" in path.parts or ".wrangler" in path.parts:
+        if (
+            not path.is_file()
+            or ".git" in path.parts
+            or ".wrangler" in path.parts
+            or ".claude" in path.parts
+        ):
             continue
         rel = path.relative_to(ROOT).as_posix()
         seen.add(rel)
