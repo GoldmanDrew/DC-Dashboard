@@ -3827,6 +3827,11 @@ function estimateIncomeStyleScenarioReturn({ underlyingReturn, sigmaAnnual, annu
   if (annualIncomeYield == null) return null;
   const dAnnual = Number(annualIncomeYield);
   const borrowAnnual = Number(annualBorrowCost);
+  // Unknown borrow (NaN) must suppress the scenario, not silently cost 0.
+  // The guard below coerces any non-finite borrow to 0, so a missing Clear
+  // Street rate would otherwise render as FREE borrow. An explicit 0 is a
+  // known-zero and still allowed through.
+  if (annualBorrowCost != null && !Number.isFinite(borrowAnnual)) return null;
   const t = Number(horizonYears);
   if (!Number.isFinite(dAnnual) || dAnnual < 0 || !Number.isFinite(t) || t <= 0) return null;
   const weeklySpreadLoss = expectedPutSpreadLossWeekly({ underlyingReturn, sigmaAnnual, horizonYears });
@@ -4100,7 +4105,7 @@ function computeFoFIncomeScenarioGrid(r, allRecords, scenarioSigma, horizonYears
         underlyingReturn: childUndReturn,
         sigmaAnnual: childSigma,
         annualIncomeYield: childYield,
-        annualBorrowCost: Number(childRec?.borrow_for_net_annual ?? childRec?.borrow_fee_annual ?? 0),
+        annualBorrowCost: Number(childRec?.borrow_for_net_annual ?? childRec?.borrow_fee_annual ?? NaN), // unknown borrow must stay NaN, not 0 -- '?? 0' rendered a missing rate as FREE borrow
         horizonYears: t,
       });
       if (!modeled) continue;
