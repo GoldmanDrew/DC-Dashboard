@@ -18,9 +18,14 @@ ALLOWED_TOP_LEVEL = {
     ".wrangler",
     "AGENTS.md",
     "README.md",
+    "_headers",  # Cloudflare Pages cache policy for the content-hashed bundle
     "assets",
+    "build.mjs",  # esbuild: assets/app.jsx -> assets/app.bundle.js
     "data",
     "index.html",
+    "node_modules",  # gitignored; esbuild devDependency only
+    "package-lock.json",  # gitignored
+    "package.json",
     "scripts",
     "tests",
 }
@@ -41,6 +46,13 @@ FORBIDDEN_FILES = {
     "requirements.txt",
     "run.py",
     "strategy_config.py",
+    # This repository is public: everything in it is served by
+    # raw.githubusercontent.com regardless of the Cloudflare Access policy on
+    # the Worker and Pages hostnames. A PBKDF2 credential file here is a
+    # published credential file -- verified 2026-07-30, HTTP 200 anonymous.
+    # Access is the real gate; the in-page login was a second, weaker door that
+    # leaked its own hashes. Never reintroduce it.
+    "data/investors.json",
 }
 FORBIDDEN_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
@@ -62,7 +74,6 @@ FORBIDDEN_JSON_KEYS = {
 }
 REQUIRED_FILES = {
     "index.html",
-    "data/investors.json",
     "data/dashboard_data.json",
     "data/borrow_history.json",
     "data/etf_metrics_daily.json",
@@ -178,6 +189,10 @@ def validate() -> None:
             or ".git" in path.parts
             or ".wrangler" in path.parts
             or ".claude" in path.parts
+            # gitignored build tooling; never deployed. Scanning third-party
+            # sources for "forbidden patterns" only invites false positives, and
+            # the esbuild binary would trip the size ceiling.
+            or "node_modules" in path.parts
         ):
             continue
         rel = path.relative_to(ROOT).as_posix()
@@ -186,7 +201,7 @@ def validate() -> None:
             raise AssertionError(f"private path in public repository: {rel}")
         if path.stat().st_size > MAX_FILE_BYTES:
             raise AssertionError(f"oversized public file: {rel}")
-        if rel in {"scripts/validate_public_boundary.py", "data/investors.json"}:
+        if rel == "scripts/validate_public_boundary.py":
             continue
         if path.suffix.lower() in {".html", ".js", ".json", ".csv", ".md", ".yml", ".yaml"}:
             text = path.read_text(encoding="utf-8", errors="ignore")
@@ -208,18 +223,24 @@ def validate() -> None:
         raise AssertionError("private commit metadata leaked into dashboard_data.json")
     _assert_borrow_sign_convention(dashboard)
 
-    investors = json.loads((ROOT / "data/investors.json").read_text(encoding="utf-8"))
-    users = investors.get("users")
-    allowed_users = {"dgoldman", "dmeis"}
-    if not isinstance(users, list) or {
-        str(user.get("id", "")).lower() for user in users if isinstance(user, dict)
-    } != allowed_users or len(users) != len(allowed_users):
-        raise AssertionError("dashboard login must contain exactly dgoldman and dmeis")
-    for user in users:
-        if set(user) != {"id", "name", "salt_b64", "hash_b64", "iterations"}:
-            raise AssertionError("dashboard login contains an unexpected credential field")
-        if not user["salt_b64"] or not user["hash_b64"] or int(user["iterations"]) < 250_000:
-            raise AssertionError("dashboard login hash is incomplete or too weak")
+    # Access control is enforced by Cloudflare Access in front of both the
+    # Worker and the Pages hostname, not by anything in this repository. Assert
+    # that no credential material has crept back in: a public repo cannot hold
+    # a password hash, and a client-side gate over public files never gated
+    # anything anyway.
+    for candidate in ("data/investors.json", "data/users.json", "data/auth.json"):
+        if (ROOT / candidate).exists():
+            raise AssertionError(
+                f"{candidate} must not exist: this repository is public, so any "
+                "credential file in it is world-readable via raw.githubusercontent.com"
+            )
+    index_text = (ROOT / "index.html").read_text(encoding="utf-8", errors="ignore")
+    for token in ("salt_b64", "hash_b64", "PBKDF2", "deriveBits"):
+        if token in index_text:
+            raise AssertionError(
+                f"index.html still references {token}: the in-page credential "
+                "gate was removed deliberately; Cloudflare Access is the gate"
+            )
 
     manifest = json.loads(
         (ROOT / "data/public_bundle_manifest.json").read_text(encoding="utf-8")

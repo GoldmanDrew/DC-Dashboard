@@ -22,6 +22,12 @@ jobs:
           python-version: "3.12"
       - name: Validate public boundary
         run: python scripts/validate_public_boundary.py
+      # Never deploy a bundle that does not match its source: index.html loads
+      # assets/app.bundle.js directly, so a stale artifact would ship silently.
+      - name: Install build tooling
+        run: npm install --no-audit --no-fund
+      - name: Verify app bundle matches assets/app.jsx
+        run: node build.mjs --check
       - name: Deploy to Cloudflare Pages
         id: deployment
         env:

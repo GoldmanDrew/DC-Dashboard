@@ -1,0 +1,16 @@
+{
+  "name": "dc-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Public static ETF research dashboard for Diamond Creek.",
+  "//type": "Deliberately NOT \"module\". The tests/ suite and assets/*.js are CommonJS/classic scripts; setting type:module makes node treat every .js here as ESM and every test fails on require(). build.mjs uses the .mjs extension instead.",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node build.mjs --check",
+    "test": "node --test tests/",
+    "serve": "python -m http.server 8000"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}

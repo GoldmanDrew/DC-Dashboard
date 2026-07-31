@@ -1,0 +1,30 @@
+# Cloudflare Pages response headers.
+#
+# Data files are requested as `data/<name>.json?v=<sha256 prefix>`, taken from
+# data/public_bundle_manifest.json. The URL therefore changes whenever the bytes
+# change, which makes the response safely immutable and lets a revisit cost one
+# 4KB manifest fetch instead of re-downloading ~54MB of JSON (etf_metrics_daily
+# 16MB, vol_shape_history 13MB, letf_rebalance_flows_daily 12MB, dashboard_data
+# 10MB) and re-parsing all of it on the main thread.
+#
+# The manifest itself must never be cached -- it is the freshness signal that
+# every other URL derives from. It is also requested with `cache: 'no-store'`,
+# so this is belt and braces.
+
+/data/public_bundle_manifest.json
+  Cache-Control: no-store
+
+/data/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# assets/app.bundle.js has no version in its URL, so it must revalidate or a
+# deploy would not reach browsers that already hold a copy. A conditional
+# request on a 372KB file is cheap; 304s keep it effectively free.
+/assets/*
+  Cache-Control: public, max-age=0, must-revalidate
+
+/index.html
+  Cache-Control: no-cache
+
+/
+  Cache-Control: no-cache
