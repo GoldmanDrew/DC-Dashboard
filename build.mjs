@@ -39,6 +39,10 @@ const result = await build({
 
 const built = result.outputFiles[0].text;
 const digest = (s) => createHash('sha256').update(s).digest('hex').slice(0, 12);
+// esbuild always emits LF. .gitattributes pins these files to LF so a Windows
+// checkout does not rewrite them, but normalise anyway so the check cannot be
+// defeated by someone's core.autocrlf.
+const norm = (s) => s.replace(/\r\n/g, '\n');
 
 if (check) {
   let committed;
@@ -48,16 +52,16 @@ if (check) {
     console.error(`[build] ${OUT} is missing. Run: node build.mjs`);
     process.exit(1);
   }
-  if (committed !== built) {
+  if (norm(committed) !== norm(built)) {
     console.error(
       `[build] ${OUT} is stale.\n` +
-        `        committed sha256=${digest(committed)}\n` +
-        `        rebuilt   sha256=${digest(built)}\n` +
+        `        committed sha256=${digest(norm(committed))}\n` +
+        `        rebuilt   sha256=${digest(norm(built))}\n` +
         `        Run: node build.mjs`
     );
     process.exit(1);
   }
-  console.log(`[build] ${OUT} matches ${ENTRY} (sha256=${digest(built)})`);
+  console.log(`[build] ${OUT} matches ${ENTRY} (sha256=${digest(norm(built))})`);
 } else {
   await writeFile(OUT, built, 'utf8');
   const src = await readFile(ENTRY, 'utf8');

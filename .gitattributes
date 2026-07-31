@@ -1,0 +1,10 @@
+# build.mjs --check compares the committed assets/app.bundle.js byte-for-byte
+# against a fresh esbuild run, which always emits LF. Without pinning these,
+# git's autocrlf rewrites the working-tree copy to CRLF on Windows and the check
+# fails on a clean checkout even though nothing changed.
+assets/app.jsx        text eol=lf
+assets/app.bundle.js  text eol=lf
+build.mjs             text eol=lf
+
+# Vendored minified runtime: never let git rewrite third-party bytes.
+assets/vendor/*.js    -text

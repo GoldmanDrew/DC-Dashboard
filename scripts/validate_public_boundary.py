@@ -13,6 +13,7 @@ ALLOWED_TOP_LEVEL = {
     ".claude",
     ".git",
     ".github",
+    ".gitattributes",
     ".gitignore",
     ".nojekyll",
     ".wrangler",
