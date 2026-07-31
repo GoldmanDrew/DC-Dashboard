@@ -319,11 +319,20 @@ function BorrowOutlookCell({ r, borrowHistoryMap, dashboardBuildTime }) {
   const sb = borrowSpikeBadge(r);
   const db = borrowModelDisagreeBadge(r);
   const sub = borrowOutlookSublabel(r);
+  const ladder = borrowLadder(r);
+  const ladderChip = borrowLadderChip(ladder);
   return (
     <div title={borrowOutlookTooltip(r, display)}>
-      <div className={cls('net-edge-merged-p50', borrowCls(o.level))} style={{ fontSize: 13 }}>
-        {o.level != null ? fmt(o.level) : '—'}
-        {borrowBadge(o.level)}
+      <div className={cls('net-edge-merged-p50', borrowCls(o.level != null ? o.level : ladder.value))} style={{ fontSize: 13 }}>
+        {o.level != null
+          ? fmt(o.level)
+          : ladder.value != null
+            ? <span className="borrow-tier-value" title={borrowLadderTitle(ladder)}>{fmt(ladder.value)}</span>
+            : '—'}
+        {borrowBadge(o.level != null ? o.level : ladder.value)}
+        {ladderChip
+          ? <span className="borrow-tier-chip" title={borrowLadderTitle(ladder)}>{ladderChip}</span>
+          : null}
         {sb ? <span className={cls('badge', sb.cls)} style={{ marginLeft: 4, fontSize: 9 }} title={sb.title}>{sb.label}</span> : null}
         {db ? <span className={cls('badge', db.cls)} style={{ marginLeft: 4, fontSize: 9 }} title={db.title}>{db.label}</span> : null}
       </div>
@@ -639,6 +648,62 @@ const numOrNull = v => {
   return Number.isFinite(n) ? n : null;
 };
 const fmt = v => v == null ? '—' : (v * 100).toFixed(2) + '%';
+/** Borrow display ladder: live -> last-good -> average -> none.
+ *
+ *  Clear Street returns a live rate for a minority of the universe, so most rows
+ *  have no spot. This resolves the best value available and always reports which
+ *  tier it came from, so a stale or averaged rate renders as such rather than
+ *  passing for live. Display only — never feed this into net-edge or carry math,
+ *  which must keep failing closed on unknown borrow.
+ *
+ *  Falls back to the record's own fields when the build predates the tier
+ *  export, so an older bundle degrades to plain live-or-dash. */
+const borrowLadder = r => {
+  const live = numOrNull(r?.borrow_current);
+  if (live != null) return { value: live, tier: 'live', ageDays: 0, n: null };
+  const tier = String(r?.borrow_display_tier || '').trim();
+  const shipped = numOrNull(r?.borrow_display_value);
+  if (shipped != null && (tier === 'last_good' || tier === 'average')) {
+    return {
+      value: shipped,
+      tier,
+      ageDays: numOrNull(r?.borrow_display_age_days),
+      asOf: r?.borrow_display_as_of || null,
+      n: numOrNull(r?.borrow_avg_n),
+    };
+  }
+  return { value: null, tier: 'none', ageDays: null, n: numOrNull(r?.borrow_avg_n) };
+};
+/** Hover text spelling out exactly where a non-live borrow value came from. */
+const borrowLadderTitle = l => {
+  if (!l) return '';
+  if (l.tier === 'live') return 'Borrow: live Clear Street rate';
+  if (l.tier === 'last_good') {
+    const parts = ['Borrow: last known Clear Street rate (no live rate today)'];
+    if (l.asOf) parts.push(`As of ${l.asOf}`);
+    if (l.ageDays != null) parts.push(`${l.ageDays} day(s) old`);
+    parts.push('Not a live quote — net edge does not use this value.');
+    return parts.join('\n');
+  }
+  if (l.tier === 'average') {
+    return [
+      'Borrow: mean of non-null Clear Street observations',
+      l.n != null ? `n = ${l.n} observation(s)` : null,
+      'No live or recent rate available. Net edge does not use this value.',
+    ].filter(Boolean).join('\n');
+  }
+  return 'Borrow: no Clear Street rate and no usable history';
+};
+/** Short provenance chip for a non-live borrow value. */
+const borrowLadderChip = l => {
+  if (!l || l.tier === 'live' || l.value == null) return null;
+  if (l.tier === 'last_good') {
+    const age = l.ageDays;
+    return age == null ? 'stale' : age <= 0 ? 'prior' : `${age}d`;
+  }
+  if (l.tier === 'average') return l.n != null ? `avg n=${l.n}` : 'avg';
+  return null;
+};
 const fmtNum = v => v == null ? '—' : Number(v).toLocaleString();
 /** Continuous-compounding annual log-rate, signed, 2 decimals. e.g. +1.20. */
 const fmtLogYr = v => {
@@ -3694,11 +3759,33 @@ function NetEdgeMergedCell({ r }) {
   } else if (anchorSource) {
     tipLines.push(`Forward forecast model: ${anchorSource}`);
   }
+  // Levered/inverse names on very high-vol underlyings produce an annualised
+  // drag that is really just ½·|δ|·|δ−1|·σ² — arithmetically correct, but not a
+  // return anyone can hold the product for a year to collect. Badge it rather
+  // than let the biggest σ² sort to the top of the book unremarked.
+  const annualizationUnreliable = r.edge_annualization_reliable === false;
+  if (annualizationUnreliable && r.edge_annualization_note) {
+    tipLines.push(`⚠ ${r.edge_annualization_note}`);
+  }
   const tip = tipLines.join('\n');
   const hasFan = Number.isFinite(Number(r.net_edge_p05_annual)) && Number.isFinite(Number(r.net_edge_p95_annual)) && Number.isFinite(Number(p50));
   return (
     <div className="net-edge-merged" title={tip} onClick={e => e.stopPropagation()}>
-      <div className={cls('net-edge-merged-p50', spreadCls(p50))}>{p50 != null ? fmtLogYr(p50) : '—'}</div>
+      <div className={cls('net-edge-merged-p50', spreadCls(p50))}>
+        {p50 != null ? fmtLogYr(p50) : '—'}
+        {annualizationUnreliable ? (
+          <span
+            style={{
+              marginLeft: 4, fontSize: 9, fontWeight: 700, padding: '0 3px',
+              borderRadius: 3, color: 'var(--warning)',
+              border: '1px solid var(--warning)', verticalAlign: 'middle',
+            }}
+            title={r.edge_annualization_note || 'annualisation not meaningful'}
+          >
+            σ²
+          </span>
+        ) : null}
+      </div>
       <div className="net-edge-merged-fan">
         {hasFan ? <NetEdgeFanGlyph r={r} w={62} h={20} vbW={58} /> : <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>—</span>}
       </div>
@@ -12889,12 +12976,32 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
             <SummaryCard
               label="Top net edge (p50)"
               value={summary.top_net_edge?.[0] ? fmtLogYr(summary.top_net_edge[0].net_edge_p50_annual) : '—'}
-              sub={summary.top_net_edge?.[0]?.symbol || ''}
+              sub={
+                summary.top_net_edge?.[0]?.symbol
+                  ? `${summary.top_net_edge[0].symbol}${
+                      summary.top_net_edge_suppressed
+                        ? ` · ${summary.top_net_edge_suppressed} suppressed`
+                        : ''
+                    }`
+                  : ''
+              }
               color="var(--positive)"
             />
+            {/* Borrow coverage, not just "did the fetch return": a partial Olympus
+                result falls back silently, and with borrow unknown net edge
+                collapses to gross decay — identical for every name in a sleeve.
+                Show the ratio so "no edge" is distinguishable from "no data". */}
             <SummaryCard label="Clear Street" value={data.clearstreet_success ? `${data.clearstreet_symbols_fetched}` : (data.studio_lending?.easy_borrow_symbols ? 'Connected' : 'Offline')}
-              sub={data.clearstreet_success ? 'symbols live' : (data.studio_lending?.easy_borrow_symbols ? `easy-borrows ${fmtNum(data.studio_lending.easy_borrow_symbols)} · no rate quotes` : 'rate fields blank')}
-              color={data.clearstreet_success ? 'var(--positive)' : 'var(--warning)'}
+              sub={
+                summary.borrow_coverage_pct != null
+                  ? `borrow coverage ${summary.borrow_coverage_pct}%${summary.borrow_coverage_ok ? '' : ` · below ${summary.borrow_coverage_floor_pct}% floor`}`
+                  : (data.clearstreet_success ? 'symbols live' : (data.studio_lending?.easy_borrow_symbols ? `easy-borrows ${fmtNum(data.studio_lending.easy_borrow_symbols)} · no rate quotes` : 'rate fields blank'))
+              }
+              color={
+                summary.borrow_coverage_pct != null && !summary.borrow_coverage_ok
+                  ? 'var(--warning)'
+                  : (data.clearstreet_success ? 'var(--positive)' : 'var(--warning)')
+              }
             />
             <div className="summary-card">
               <div className="label">Top 5 realized net (rebates excluded)</div>
@@ -12928,6 +13035,20 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
                   </li>
                 ))}
               </ul>
+              {summary.top_net_edge_suppressed ? (
+                <div
+                  style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.4 }}
+                  title={
+                    'Levered/inverse names whose annualised drag is dominated by the underlying’s '
+                    + 'σ² term (½·|δ|·|δ−1|·σ²). Ranking on those sorts the book by variance, '
+                    + 'not by edge, so they are excluded here and badged σ² in the table.'
+                  }
+                >
+                  {summary.top_net_edge_suppressed} name
+                  {summary.top_net_edge_suppressed === 1 ? '' : 's'} suppressed — annualisation not
+                  meaningful (σ²-dominated)
+                </div>
+              ) : null}
             </div>
           </div>
 
