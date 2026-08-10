@@ -1,0 +1,81 @@
+name: Public health sentinel
+
+# Nothing in this repository was scheduled: validate.yml and deploy-pages.yml
+# both trigger only on push/PR. Publishing happens locally in the private repo
+# ("chore: market tick (local)"), so if the publisher stops, the public site
+# serves stale data indefinitely and no workflow ever runs to notice.
+#
+# This is the liveness watchdog. It never commits — a commit here would trigger
+# a Cloudflare Pages deploy, and any file written under data/ would be swept
+# into the bundle manifest. Findings go to the job summary and one rolling
+# GitHub issue (label ops/public-health) that auto-closes on recovery.
+#
+# Boundary/sanitization checks stay in validate_public_boundary.py; this asks
+# only "is the published bundle still alive and still sane?".
+
+on:
+  schedule:
+    # Pre-open, midday, and post-close US market hours (UTC), weekdays. Offset
+    # off the hour so a run never races a publish landing on the hour.
+    - cron: "40 13 * * 1-5"
+    - cron: "40 18 * * 1-5"
+    - cron: "40 22 * * 1-5"
+    # One weekend check: a publisher that dies Friday evening should not stay
+    # undetected until Monday.
+    - cron: "40 15 * * 6"
+  push:
+    branches: [main]
+    paths:
+      - "data/**"
+      - "scripts/public_health_sentinel.py"
+      - ".github/workflows/public-health.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: public-health
+  cancel-in-progress: false
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the regression check compares this bundle against the
+          # previously published one via `git show`.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Stdlib only by construction: requirements.txt is in the boundary
+      # validator's FORBIDDEN_FILES, so there is nothing to install.
+      - name: Sentinel unit tests
+        run: python tests/test_public_health_sentinel.py
+
+      - name: Check published bundle
+        id: check
+        run: |
+          python scripts/public_health_sentinel.py check \
+            --report-out "$RUNNER_TEMP/public_health.json" \
+            --strict
+
+      # if: always() — the alert must fire precisely when the check failed, and
+      # must also run on success so a recovered bundle closes the open issue.
+      - name: Alert
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f "$RUNNER_TEMP/public_health.json" ]; then
+            python scripts/public_health_sentinel.py alert --report "$RUNNER_TEMP/public_health.json"
+          else
+            echo "::warning title=public-health::no report produced — the check step crashed before writing one"
+          fi
