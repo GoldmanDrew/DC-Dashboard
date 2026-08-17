@@ -1011,12 +1011,40 @@ async function loadBorrowHistoryCache() {
   return BORROW_HISTORY_CACHE;
 }
 
-/** Prefer CI-built history JSON; fall back to client recompute from metrics rows. */
+/** Last dated point of a vol-shape series, '' when there is none. */
+function volShapeHistoryLastDate(hist) {
+  const series = hist?.series;
+  if (!Array.isArray(series) || !series.length) return '';
+  return String(series[series.length - 1]?.date || '').slice(0, 10);
+}
+
+/**
+ * Whichever of the two sources carries the more recent last observation.
+ *
+ * This used to be "take the pre-built file whenever it has any points at all",
+ * which silently pinned every chart to whatever vintage that file happened to
+ * be. Between 2026-08-07 and 08-17 the mirrored copy was frozen 13 sessions
+ * back, and for a newly listed ETF (AXTX had exactly 61 joint closes at that
+ * vintage, so exactly one 60-day window) a single stale point outranked the
+ * six fresher ones the browser could compute from metrics it already held —
+ * and one point plots as a dot with no line.
+ *
+ * Ties go to the pre-built file: same last date means same underlying data,
+ * and it carries the longer point-in-time history.
+ */
+function pickFresherVolShapeHistory(pre, computed) {
+  const preLast = volShapeHistoryLastDate(pre);
+  const computedLast = volShapeHistoryLastDate(computed);
+  if (!preLast) return computed;
+  if (!computedLast) return pre;
+  return computedLast > preLast ? computed : pre;
+}
+
+/** Prefer whichever of the CI-built history and the client recompute is fresher. */
 function volShapeHistoryForSymbol(sym, metricsRows, window = VOL_SHAPE_PRIMARY_WINDOW) {
   const key = String(sym || '').toUpperCase();
   const pre = VOL_SHAPE_HISTORY_CACHE?.symbols?.[key];
-  if (pre?.series?.length) return pre;
-  return volShapeHistoryFromMetricsRows(metricsRows, window);
+  return pickFresherVolShapeHistory(pre, volShapeHistoryFromMetricsRows(metricsRows, window));
 }
 
 function volShapeLatestFromHistory(volShapeHistory) {
@@ -3795,11 +3823,20 @@ function NetEdgeMergedCell({ r }) {
 
 function EdgeFactsStrip({ r }) {
   const mode = (r.borrow_resample_mode || '').trim();
+  // point_in_time_thin_history was missing from this map, so the strip that
+  // exists to say which borrow went into the net edge rendered nothing for the
+  // rows that most need it: on 2026-08-17 that was 510 of 551 records, every
+  // one of them sitting below MIN_BORROW_HISTORY_FOR_RESAMPLE (20) because the
+  // Clear Street history restarted at the 2026-07-27 cutover and was only 18
+  // observations deep. The strip was visible for the 5 rows in plain
+  // point_in_time and invisible for the rest.
   const borrowLabel = mode === 'weighted_empirical'
     ? 'Borrow: weighted history'
-    : mode === 'point_in_time'
-      ? 'Borrow: point-in-time'
-      : null;
+    : mode === 'point_in_time_thin_history'
+      ? `Borrow: point-in-time (thin history${r.borrow_history_points_used != null ? `, ${Math.round(Number(r.borrow_history_points_used))} obs` : ''})`
+      : mode === 'point_in_time'
+        ? 'Borrow: point-in-time'
+        : null;
   if (!borrowLabel) return null;
   return (
     <div className="edge-facts-strip" aria-label="Borrow in net-edge bootstrap">
@@ -6487,12 +6524,14 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
       )
       : []
   ), [realizedDailyDragSeries, decayRollWindow, decayBorrowAnnual]);
+  // Same source rule as volShapeHistoryForSymbol, and the same joint/contiguity
+  // filter: this used to recompute off etfBacktestSeries while the grid path
+  // went through jointMetricsRowsForVolShape, so the two could disagree for any
+  // symbol with a lifecycle gap. One helper, one answer.
   const volShapeHistory = useMemo(() => {
     const raw = Array.isArray(etfMetricsMap?.[etfSym]) ? etfMetricsMap[etfSym] : [];
-    const pre = VOL_SHAPE_HISTORY_CACHE?.symbols?.[etfSym];
-    if (pre?.series?.length) return pre;
-    return buildUnderlyingVolShapeHistory(etfBacktestSeries);
-  }, [etfSym, etfBacktestSeries, etfMetricsMap]);
+    return volShapeHistoryForSymbol(etfSym, raw);
+  }, [etfSym, etfMetricsMap]);
   const volShape = useMemo(
     () => volShapeDisplay(r, {
       volShapeHistory,
@@ -8053,9 +8092,31 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
 
             <div className="scenario-title" style={{ marginTop: 18 }}>Volatility shape history — {undSym || 'underlying'}</div>
             <div className="scenario-sub">
-              Rolling {volShapeHistory.window || VOL_SHAPE_PRIMARY_WINDOW} trading-day windows from joint ETF metrics underlying adj. close (headline TR/VCR matches charts). {volShapeSourceHint(volShape) ? volShapeSourceHint(volShape) + '.' : ''} Trend Ratio = weekly-sampled RV / daily-sampled RV (iid≈1, perfect drift≈{Math.sqrt(5).toFixed(2)}); VCR = largest daily variance share inside the window.
+              Rolling {volShapeHistory.window || VOL_SHAPE_PRIMARY_WINDOW} trading-day windows from joint ETF metrics underlying adj. close. {volShapeSourceHint(volShape) ? volShapeSourceHint(volShape) + '.' : ''} Trend Ratio = weekly-sampled RV / daily-sampled RV (iid≈1, perfect drift≈{Math.sqrt(5).toFixed(2)}); VCR = largest daily variance share inside the window.
             </div>
-            {volShapeHistory.series.length > 0 ? (
+            {/*
+              This line used to assert "headline TR/VCR matches charts" as a
+              constant. It was false for every symbol from 2026-08-07 to 08-17,
+              and the assertion is exactly what stopped the divergence being
+              noticed. Print both dates instead, and say so when they differ.
+            */}
+            {(() => {
+              const chartDate = volShapeHistoryLastDate(volShapeHistory);
+              const headDate = String(r?.und_vol_shape_metrics_asof || '').slice(0, 10);
+              if (!chartDate && !headDate) return null;
+              const agree = Boolean(chartDate) && chartDate === headDate;
+              return (
+                <div className={cls('scenario-sub', !agree && chartDate && headDate && 'scenario-warning')}>
+                  {agree
+                    ? `Charts and headline TR/VCR both as of ${chartDate}.`
+                    : `Charts as of ${chartDate || '—'}; headline TR/VCR as of ${headDate || '—'}. `
+                      + 'They are computed from different vintages of the same panel — read the headline, not the last chart point.'}
+                </div>
+              );
+            })()}
+            {/* >= 2, not > 0: one point is a dot with no line, which reads as a
+                broken chart rather than as "not enough history yet". */}
+            {volShapeHistory.series.length >= 2 ? (
               <div className="metrics-stack" style={{ marginTop: 8 }}>
                 <SimpleSeriesPlot
                   series={volShapeHistory.series}
@@ -8095,7 +8156,10 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
               </div>
             ) : (
               <div className="scenario-warning" style={{ marginTop: 8 }}>
-                Need at least {(volShapeHistory.window || VOL_SHAPE_PRIMARY_WINDOW) + 1} underlying adjusted-close observations to draw volatility-shape history.
+                {volShapeHistory.series.length === 1
+                  ? `Only one ${volShapeHistory.window || VOL_SHAPE_PRIMARY_WINDOW}-day window is available (as of ${volShapeHistoryLastDate(volShapeHistory)}), so there is no line to draw yet. `
+                    + `This ETF needs ${(volShapeHistory.window || VOL_SHAPE_PRIMARY_WINDOW) + 2} joint observations before the history plots; the headline TR/VCR above is still valid.`
+                  : `Need at least ${(volShapeHistory.window || VOL_SHAPE_PRIMARY_WINDOW) + 1} underlying adjusted-close observations to draw volatility-shape history.`}
               </div>
             )}
           </div>

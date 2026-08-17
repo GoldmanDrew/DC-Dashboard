@@ -249,10 +249,15 @@
     }
     const buildMin = ageMinutesSince(data.build_time);
     const optMin = ageMinutesSince(vrpHealth && vrpHealth.last_options_refresh);
-    const worstSleeveOptMin = Number.isFinite(Number(vrpHealth && vrpHealth.worst_sleeve_options_age_minutes))
-      ? Number(vrpHealth.worst_sleeve_options_age_minutes) : null;
-    const worstUndOptMin = Number.isFinite(Number(vrpHealth && vrpHealth.worst_underlying_options_age_minutes))
-      ? Number(vrpHealth.worst_underlying_options_age_minutes) : null;
+    // Guard the DEREFERENCE, not just the read. `vrpHealth && vrpHealth.x` is
+    // null when vrpHealth is null, Number(null) is 0, and 0 is finite — so the
+    // old test passed and the branch below then read a property off null,
+    // throwing inside render and blanking the whole dashboard. It fires
+    // whenever vrp_health.json has not resolved yet at first paint, which is a
+    // load-order race: reproducible on a hard reload of the published bundle.
+    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+    const worstSleeveOptMin = vrpHealth ? num(vrpHealth.worst_sleeve_options_age_minutes) : null;
+    const worstUndOptMin = vrpHealth ? num(vrpHealth.worst_underlying_options_age_minutes) : null;
     const worstUndSym = vrpHealth && vrpHealth.worst_underlying_symbol
       ? String(vrpHealth.worst_underlying_symbol).toUpperCase() : null;
     const holdingsDays = vrpHealth && vrpHealth.holdings_age_trading_days != null
