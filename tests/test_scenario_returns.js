@@ -12,6 +12,7 @@ const {
 } = require("../assets/scenario_returns.js");
 
 test("horizon conversion", () => {
+  assert.equal(horizonToYears("20D"), 20 / 252);
   assert.equal(horizonToYears("1M"), 1 / 12);
   assert.equal(horizonToYears("3M"), 3 / 12);
   assert.equal(horizonToYears("6M"), 6 / 12);

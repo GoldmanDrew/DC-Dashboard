@@ -21,6 +21,9 @@
 
   function horizonToYears(horizonKey) {
     const k = String(horizonKey || "").toUpperCase();
+    // Trading-day horizon (252/yr), so the headline "Exp. ETF return" cell sits on
+    // the same 20-trading-day window as the "Realized decay (20d)" column.
+    if (k === "20D") return 20 / TRADING_DAYS;
     if (k === "1M") return 1 / 12;
     if (k === "3M") return 3 / 12;
     if (k === "6M") return 6 / 12;

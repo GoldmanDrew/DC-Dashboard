@@ -1735,15 +1735,23 @@ const scenShortFavCls = v => {
   return 'val-negative';
 };
 
+// Headline "Exp. ETF return" horizon: 20 trading days, the same window as the
+// Realized decay (20d) column, so the realized and expected cells sit side by
+// side on one horizon instead of asking the reader to rescale 3M in their head.
+// The old 3M horizon was chosen for stability (CV scales as 1/√T), and that
+// trade is real — the 20d cell is noisier in relative terms — but a headline
+// that matches its neighbour is worth more than the smoothing. 1M/3M/6M stay
+// one hover away.
+const EXP_ETF_HORIZON_LABEL = '20D';
+const EXP_ETF_HORIZON_YEARS = 20 / 252;
+
 // Sort key for the headline expected-ETF-return column.
 // Convention: scenario_etf_<horizon>_0und_<sigma_source>.
-//   horizon       = 3M (chosen over 1M for stability — CV scales as 1/√T,
-//                   so 3M is ~42% less noisy in relative terms; structural
-//                   decay accumulates ~3× while noise only grows √3×).
+//   horizon       = 20 trading days (20/252 yr), matching Realized decay (20d).
 //   underlying    = 0% (flat) — same as Scenarios tab "0×" shock column.
 //   sigma_source  = shared forecast σ (50/50 model-implied variance +
 //                   robust 6M EWMA variance when both exist).
-const SCENARIO_ETF_3M_FLAT_SORT_KEY = 'scenario_etf_3m_0und_forecast_sigma';
+const SCENARIO_ETF_20D_FLAT_SORT_KEY = 'scenario_etf_20d_0und_forecast_sigma';
 
 const YIELDBOOST_INCOME_PAIRS = new Set([
   'AMYY|AMD', 'AZYY|AMZN', 'BBYY|BABA', 'COYY|COIN', 'CWY|CRWV',
@@ -2472,10 +2480,10 @@ function forecastVolForScenario(r, chartVolLookbackRange) {
  *     economics use `netShortPnl` in the Scenarios income table.
  *   - Passive low-δ / non-income Bucket 2 → `null` (suppressed by policy).
  *
- * Horizon is **3M** by default (caller passes `'3M'` for the headline cell
- * and `'1M'` for the secondary tooltip number). 3M chosen over 1M because
- * CV of the forecast scales as 1/√T (~42% less noisy in relative terms
- * than 1M) and structural decay is more visible at 3M.
+ * Horizon is **20 trading days** by default (`EXP_ETF_HORIZON_LABEL`), matching
+ * the Realized decay (20d) column so the two grid cells are on one window. The
+ * tooltip still prints 1M/3M/6M — the longer horizons are less noisy in
+ * relative terms (CV scales as 1/√T) and show structural decay more clearly.
  *
  * `chartVolLookbackRange` is only a backward-compatible fallback when older
  * data does not ship forecast_vol_underlying_annual.
@@ -2503,7 +2511,7 @@ function yieldBoostExpectedNetAnnualScenario(r, chartVolLookbackRange, horizonYe
   });
 }
 
-function computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, horizonLabel = '3M') {
+function computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, horizonLabel = EXP_ETF_HORIZON_LABEL) {
   if (suppressScenarioForRow(r)) return null;
   const SR = typeof window !== 'undefined' ? window.ScenarioReturns : null;
   if (!SR || typeof SR.horizonToYears !== 'function') return null;
@@ -2537,9 +2545,9 @@ function computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, horizonLabel 
   return Number.isFinite(combined) ? combined : res.value;
 }
 
-// Convenience wrapper: headline 3M return used by the main-table column.
-function computeScenarioEtf3mFlatUnd(r, chartVolLookbackRange) {
-  return computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, '3M');
+// Convenience wrapper: headline 20-trading-day return used by the main-table column.
+function computeScenarioEtf20dFlatUnd(r, chartVolLookbackRange) {
+  return computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, EXP_ETF_HORIZON_LABEL);
 }
 
 function fofCashFractionFromBasket(basket) {
@@ -2766,6 +2774,10 @@ const borrowBadge = v => {
 };
 
 const VOL_TF_KEY_BY_RANGE = {
+  // The 20-trading-day headline horizon has no window of its own in
+  // `dividend_adjustment` / `realized_vol`; 1M is the nearest and is scaled by
+  // the caller's horizonYears, so the cash leg stays horizon-matched.
+  '20D': '1M',
   '1M': '1M',
   '3M': '3M',
   '6M': '6M',
@@ -3370,12 +3382,12 @@ const COLS = [
     hint: 'Trailing 20 trading-day gross pair return (δ·log U − log L), period not annualized. Same as Decay tab 20d Gross. Short-favorable +. Not Gross (realiz.) annual.',
   },
   {
-    key: SCENARIO_ETF_3M_FLAT_SORT_KEY,
+    key: SCENARIO_ETF_20D_FLAT_SORT_KEY,
     label: 'Exp. ETF return',
-    sublabel: '3M · long · no borrow',
+    sublabel: '20d · long · no borrow',
     w: 122,
     numeric: true,
-    hint: 'Long total return ~3M if underlying is flat; borrow excluded. σ = forecast. Income: option NAV path + cash. Others: +window dividends when known. Hover: 1M/6M. Sign is long-friendly (inverse for naked shorts).',
+    hint: 'Long total return over 20 trading days if underlying is flat; borrow excluded. Same horizon as Realized decay (20d), opposite sign convention (this one is long-favorable). σ = forecast. Income: option NAV path + cash. Others: +window dividends when known. Hover: 1M/3M/6M.',
   },
   {
     key: 'vol_underlying_annual',
@@ -7825,12 +7837,13 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
               )}
             </div>
             {(() => {
-              const expEtf3m = computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, '3M');
+              const expEtf20d = computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, EXP_ETF_HORIZON_LABEL);
               const expEtf1m = computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, '1M');
+              const expEtf3m = computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, '3M');
               const expEtf6m = computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, '6M');
               return (
                 <div
-                  className={cls('chart-stat', scenarioValueCls(r, expEtf3m))}
+                  className={cls('chart-stat', scenarioValueCls(r, expEtf20d))}
                   title={
                     isPassiveLowDeltaRow(r)
                       ? PASSIVE_LOW_DELTA_POLICY_TOOLTIP
@@ -7845,26 +7858,26 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
                             } else {
                               lines.push('Long total return, no borrow: Itô vol path + horizon-matched cash when recurring.');
                               lines.push(`σ (forecast): ${fmt(forecastVolForScenario(r, chartVolLookbackRange).sigma)}.`);
-                              const nav3 = computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, '3M');
-                              const div3 = dividendCashAdditiveForHorizon(r, '3M', 3 / 12);
-                              if (Number.isFinite(nav3) && Number.isFinite(div3) && div3 !== 0) {
-                                lines.push(`3M decomposition: NAV ${fmt(nav3 - div3)} + cash ${fmt(div3)} = ${fmt(nav3)}`);
+                              const div20d = dividendCashAdditiveForHorizon(r, EXP_ETF_HORIZON_LABEL, EXP_ETF_HORIZON_YEARS);
+                              if (Number.isFinite(expEtf20d) && Number.isFinite(div20d) && div20d !== 0) {
+                                lines.push(`20d decomposition: NAV ${fmt(expEtf20d - div20d)} + cash ${fmt(div20d)} = ${fmt(expEtf20d)}`);
                               }
                               lines.push('Ex-dates: Scenarios tab.');
                             }
                             if (r?.forecast_vol_event_adjusted) lines.push('EWMA leg clipped a large one-day move.');
                             lines.push('');
                             lines.push('Other horizons:');
+                            lines.push(`  20d: ${expEtf20d != null && Number.isFinite(expEtf20d) ? fmt(expEtf20d) : '—'}  (table headline)`);
                             lines.push(`  1M: ${expEtf1m != null && Number.isFinite(expEtf1m) ? fmt(expEtf1m) : '—'}`);
-                            lines.push(`  3M: ${expEtf3m != null && Number.isFinite(expEtf3m) ? fmt(expEtf3m) : '—'}  (table headline)`);
+                            lines.push(`  3M: ${expEtf3m != null && Number.isFinite(expEtf3m) ? fmt(expEtf3m) : '—'}`);
                             lines.push(`  6M: ${expEtf6m != null && Number.isFinite(expEtf6m) ? fmt(expEtf6m) : '—'}`);
                             return lines.join('\n');
                           })()
                   }
                 >
                   <div className="cs-label">Exp. ETF return</div>
-                  <div className="cs-sub" style={{ marginBottom: 2, textTransform: 'none', letterSpacing: 0 }}>3M · long · no borrow</div>
-                  <div className="cs-value">{expEtf3m != null && Number.isFinite(expEtf3m) ? fmt(expEtf3m) : '—'}</div>
+                  <div className="cs-sub" style={{ marginBottom: 2, textTransform: 'none', letterSpacing: 0 }}>20d · long · no borrow</div>
+                  <div className="cs-value">{expEtf20d != null && Number.isFinite(expEtf20d) ? fmt(expEtf20d) : '—'}</div>
                 </div>
               );
             })()}
@@ -12844,8 +12857,8 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
       d = d.filter(r => r.symbol.includes(s) || r.underlying.includes(s));
     }
     d.sort((a, b) => {
-      let av = sortKey === SCENARIO_ETF_3M_FLAT_SORT_KEY
-        ? computeScenarioEtf3mFlatUnd(a, chartVolLookbackRange)
+      let av = sortKey === SCENARIO_ETF_20D_FLAT_SORT_KEY
+        ? computeScenarioEtf20dFlatUnd(a, chartVolLookbackRange)
         : sortKey === 'expected_pair_pnl_p50_annual' || sortKey === 'expected_gross_decay_p50_annual' || sortKey === 'expected_gross_decay_annual'
         ? expectedDecayHeadlineValue(a, chartVolLookbackRange)
         : sortKey === 'vol_underlying_annual'
@@ -12853,8 +12866,8 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
         : sortKey === 'vol_etf_annual'
         ? volHeadlineValue(a, 'etf', chartVolLookbackRange)
         : a[sortKey];
-      let bv = sortKey === SCENARIO_ETF_3M_FLAT_SORT_KEY
-        ? computeScenarioEtf3mFlatUnd(b, chartVolLookbackRange)
+      let bv = sortKey === SCENARIO_ETF_20D_FLAT_SORT_KEY
+        ? computeScenarioEtf20dFlatUnd(b, chartVolLookbackRange)
         : sortKey === 'expected_pair_pnl_p50_annual' || sortKey === 'expected_gross_decay_p50_annual' || sortKey === 'expected_gross_decay_annual'
         ? expectedDecayHeadlineValue(b, chartVolLookbackRange)
         : sortKey === 'vol_underlying_annual'
@@ -13152,9 +13165,9 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
             <strong>Net edge</strong> — bootstrap of past gross + borrow, level-shifted to Exp. edge fwd via inverse-variance blend; dot = p50, whisker = p5–p95. Details below.
           </p>
           <p style={{ padding: '0 24px 8px', margin: 0, fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.45, maxWidth: 1100 }}>
-            <strong style={{ color: 'var(--text-secondary)' }}>Recent realized vs forward long (3M):</strong>{' '}
+            <strong style={{ color: 'var(--text-secondary)' }}>Recent realized vs forward long (20 trading days):</strong>{' '}
             <strong>Realized decay (20d)</strong> — trailing 20 trading-day gross pair return (Decay tab Gross; period, not annualized; short-favorable +).{' '}
-            <strong>Exp. ETF return</strong> — long <strong>total return</strong> if the underlying is flat, <strong>borrow excluded</strong>; income names add <strong>cash payouts</strong> on top of the NAV path (+ is good for longs, bad for naked shorts). Same forecast σ as Scenarios. Hover for 1M/6M. Passive low-δ (non-income): <strong>—</strong>.{' '}
+            <strong>Exp. ETF return</strong> — long <strong>total return</strong> if the underlying is flat, <strong>borrow excluded</strong>; income names add <strong>cash payouts</strong> on top of the NAV path (+ is good for longs, bad for naked shorts). Same horizon as Realized decay (20d). Same forecast σ as Scenarios. Hover for 1M/3M/6M. Passive low-δ (non-income): <strong>—</strong>.{' '}
             <strong>Vol Und / Vol ETF</strong> — best-estimate σ (Vol Und = forecast blend, same as Scenarios; Vol ETF = 6M robust EWMA). Hover for realized ladder.
             {data?.uncertainty_footnote && (
               <span> {data.uncertainty_footnote}</span>
@@ -13177,7 +13190,7 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
                   <br /><br />
                   <strong>Realized decay (20d)</strong>: trailing 20 trading-day gross pair return (Decay tab Gross; period not annualized; short-favorable +).
                   <br /><br />
-                  <strong>Exp. ETF return (3M)</strong>: long total return at flat underlying (NAV + cash for income), borrow excluded. Long-favorable sign; different horizon and object than Exp. edge (fwd).
+                  <strong>Exp. ETF return (20d)</strong>: long total return at flat underlying (NAV + cash for income), borrow excluded, over the same 20-trading-day window as Realized decay. Long-favorable sign — a different object than Exp. edge (fwd), which is annualized and short-favorable.
                 </p>
               </div>
               <div className="dm-block">
@@ -13226,9 +13239,9 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
                 </p>
               </div>
               <div className="dm-block">
-                <div className="dm-title">Exp. ETF return (3M) — long TR, flat spot, no borrow</div>
+                <div className="dm-title">Exp. ETF return (20d) — long TR, flat spot, no borrow</div>
                 <p style={{ margin: '0 0 8px', lineHeight: 1.5 }}>
-                  Horizon <strong>3M</strong>, underlying shock <strong>0</strong>, σ = <code>forecast_vol_underlying_annual</code> (Scenarios match). Cash dates: Scenarios tab.
+                  Horizon <strong>20 trading days</strong> (T = 20/252 yr, matching Realized decay), underlying shock <strong>0</strong>, σ = <code>forecast_vol_underlying_annual</code> (Scenarios match). Cash leg reads the 1M <code>dividend_adjustment</code> window, rescaled to T. Cash dates: Scenarios tab.
                   <br /><br />
                   <strong>LETF / inverse / vol-ETP</strong>: vol drag with <em>L</em> = δ:{' '}
                   <code className="dm-formula">dragLog = ½·L·(L−1)·σ²·T</code>,{' '}
@@ -13236,7 +13249,7 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
                   <br /><br />
                   <strong>Income</strong>: long TR = <strong>−NAV decay + cash</strong> (Scenarios closed form; borrow omitted). Different object from Exp. edge (fwd).
                   <br /><br />
-                  Hover cell for 1M/6M. Non-income passive Bucket 2: <strong>—</strong>.
+                  Hover cell for 1M/3M/6M. Non-income passive Bucket 2: <strong>—</strong>.
                 </p>
               </div>
               <div className="dm-block">
@@ -13279,8 +13292,9 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
               <tbody>
                 {filtered.map(r => {
                   const expanded = expandedSym === r.symbol;
-                  const expEtf3m = computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, '3M');
+                  const expEtf20d = computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, EXP_ETF_HORIZON_LABEL);
                   const expEtf1m = computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, '1M');
+                  const expEtf3m = computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, '3M');
                   const expEtf6m = computeExpectedEtfReturnFlatUnd(r, chartVolLookbackRange, '6M');
                   return (
                     <React.Fragment key={r.symbol}>
@@ -13328,7 +13342,7 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
                           {realizedPairGross20dDisplay(r)}
                         </td>
                         <td
-                          className={scenarioValueCls(r, expEtf3m)}
+                          className={scenarioValueCls(r, expEtf20d)}
                           title={
                             isPassiveLowDeltaRow(r)
                               ? PASSIVE_LOW_DELTA_POLICY_TOOLTIP
@@ -13343,23 +13357,24 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
                                     } else {
                                       lines.push('Long total return, no borrow: Itô vol path + horizon-matched cash when recurring.');
                                       lines.push(`σ (forecast): ${fmt(forecastVolForScenario(r, chartVolLookbackRange).sigma)}.`);
-                                      const div3 = dividendCashAdditiveForHorizon(r, '3M', 3 / 12);
-                                      if (Number.isFinite(expEtf3m) && Number.isFinite(div3) && div3 !== 0) {
-                                        lines.push(`3M decomposition: NAV ${fmt(expEtf3m - div3)} + cash ${fmt(div3)} = ${fmt(expEtf3m)}`);
+                                      const div20d = dividendCashAdditiveForHorizon(r, EXP_ETF_HORIZON_LABEL, EXP_ETF_HORIZON_YEARS);
+                                      if (Number.isFinite(expEtf20d) && Number.isFinite(div20d) && div20d !== 0) {
+                                        lines.push(`20d decomposition: NAV ${fmt(expEtf20d - div20d)} + cash ${fmt(div20d)} = ${fmt(expEtf20d)}`);
                                       }
                                       lines.push('Ex-dates: Scenarios tab.');
                                     }
                                     if (r?.forecast_vol_event_adjusted) lines.push('EWMA leg clipped a large one-day move.');
                                     lines.push('');
                                     lines.push('Other horizons:');
+                                    lines.push(`  20d: ${expEtf20d != null && Number.isFinite(expEtf20d) ? fmt(expEtf20d) : '—'}  (table headline)`);
                                     lines.push(`  1M: ${expEtf1m != null && Number.isFinite(expEtf1m) ? fmt(expEtf1m) : '—'}`);
-                                    lines.push(`  3M: ${expEtf3m != null && Number.isFinite(expEtf3m) ? fmt(expEtf3m) : '—'}  (table headline)`);
+                                    lines.push(`  3M: ${expEtf3m != null && Number.isFinite(expEtf3m) ? fmt(expEtf3m) : '—'}`);
                                     lines.push(`  6M: ${expEtf6m != null && Number.isFinite(expEtf6m) ? fmt(expEtf6m) : '—'}`);
                                     return lines.join('\n');
                                   })()
                           }
                         >
-                          {expEtf3m != null && Number.isFinite(expEtf3m) ? fmt(expEtf3m) : '—'}
+                          {expEtf20d != null && Number.isFinite(expEtf20d) ? fmt(expEtf20d) : '—'}
                         </td>
                         <td title={volHeadlineTooltip(r, "underlying", chartVolLookbackRange)}>{fmt(volHeadlineValue(r, 'underlying', chartVolLookbackRange))}</td>
                         <td title={volHeadlineTooltip(r, "etf", chartVolLookbackRange)}>{fmt(volHeadlineValue(r, 'etf', chartVolLookbackRange))}</td>
