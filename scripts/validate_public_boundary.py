@@ -25,6 +25,12 @@ ALLOWED_TOP_LEVEL = {
     "data",
     "index.html",
     "node_modules",  # gitignored; esbuild devDependency only
+    # Local-only, like node_modules above. This repo ships tests/ and a pytest
+    # suite, so running its own tests writes .pytest_cache here -- and that used
+    # to fail this check, which fails the publish step, which silently stops the
+    # public site from updating. pytest writes .pytest_cache/.gitignore ("*") so
+    # git already ignores it; it just must not be able to block a publish.
+    ".pytest_cache",
     "package-lock.json",  # gitignored
     "package.json",
     "scripts",
