@@ -157,6 +157,84 @@ class ManifestCoverageTests(unittest.TestCase):
         self.assertEqual(out[0]["code"], "manifest_unreadable")
 
 
+class EscalationTests(unittest.TestCase):
+    """
+    The watchdog's job is to be heard. It filed one warn on 2026-08-19 and then
+    said nothing for three weeks while the bundle went from stale to three-weeks
+    dead: the fingerprint stopped changing, so every later run took the
+    "unchanged findings" path. These cover the paths that must still speak.
+    """
+
+    FAIL_FINDINGS = [{"severity": phs.FAIL, "code": "bundle_not_publishing",
+                      "artifact": "data/", "detail": "dead", "stale_days": 23}]
+    WARN_FINDINGS = [{"severity": phs.WARN, "code": "bundle_stale",
+                      "artifact": "data/", "detail": "slow"}]
+
+    def test_first_report_speaks(self):
+        speak, _ = phs.should_speak(None, phs.FAIL, "abc", "2026-09-09")
+        self.assertTrue(speak)
+
+    def test_warn_to_fail_escalation_always_speaks(self):
+        prev = {"fp": "abc", "verdict": phs.WARN, "day": "2026-09-09"}
+        speak, why = phs.should_speak(prev, phs.FAIL, "abc", "2026-09-09")
+        self.assertTrue(speak)
+        self.assertIn("escalated", why)
+
+    def test_unresolved_fail_nags_once_a_day(self):
+        prev = {"fp": "abc", "verdict": phs.FAIL, "day": "2026-09-08"}
+        speak, why = phs.should_speak(prev, phs.FAIL, "abc", "2026-09-09")
+        self.assertTrue(speak, "a fail that is still failing must not go silent")
+        self.assertEqual(why, "still failing")
+
+    def test_same_day_fail_does_not_spam(self):
+        prev = {"fp": "abc", "verdict": phs.FAIL, "day": "2026-09-09"}
+        speak, _ = phs.should_speak(prev, phs.FAIL, "abc", "2026-09-09")
+        self.assertFalse(speak)
+
+    def test_steady_warn_stays_quiet(self):
+        prev = {"fp": "abc", "verdict": phs.WARN, "day": "2026-09-08"}
+        speak, _ = phs.should_speak(prev, phs.WARN, "abc", "2026-09-09")
+        self.assertFalse(speak)
+
+    def test_changed_findings_speak(self):
+        prev = {"fp": "abc", "verdict": phs.WARN, "day": "2026-09-09"}
+        speak, why = phs.should_speak(prev, phs.WARN, "def", "2026-09-09")
+        self.assertTrue(speak)
+        self.assertEqual(why, "findings changed")
+
+    def test_title_carries_the_age(self):
+        title = phs.alert_title(phs.FAIL, self.FAIL_FINDINGS)
+        self.assertIn("23 days ago", title)
+        self.assertIn(phs.FAIL, title)
+
+    def test_title_falls_back_to_finding_count(self):
+        self.assertIn("1 finding(s)", phs.alert_title(phs.WARN, self.WARN_FINDINGS))
+
+    def test_stale_days_is_not_part_of_the_fingerprint(self):
+        # Only (code, artifact, severity) identify a finding; a growing day count
+        # must not masquerade as "findings changed".
+        day1 = [dict(self.FAIL_FINDINGS[0], stale_days=1)]
+        day9 = [dict(self.FAIL_FINDINGS[0], stale_days=9)]
+        self.assertEqual(phs._fingerprint(day1), phs._fingerprint(day9))
+
+
+class StalenessBudgetTests(unittest.TestCase):
+    def test_two_dead_sessions_is_a_fail(self):
+        # 26 market-hours (4 sessions) let a dead publisher read as merely slow
+        # for most of a week.
+        self.assertLessEqual(phs.STALE_FAIL_HOURS, 13.0)
+        self.assertGreater(phs.STALE_FAIL_HOURS, phs.STALE_WARN_HOURS)
+
+    def test_fail_finding_reports_wall_clock_days(self):
+        now = datetime(2026, 9, 9, 16, 0, tzinfo=UTC)
+        payloads = {"data/x.json": {"build_time": "2026-08-17T21:04:00Z"}}
+        findings = phs.check_liveness(payloads, now)
+        dead = [f for f in findings if f["code"] == "bundle_not_publishing"]
+        self.assertEqual(len(dead), 1)
+        self.assertEqual(dead[0]["stale_days"], 22)
+        self.assertIn("22 days ago", dead[0]["detail"])
+
+
 class LiveBundleTests(unittest.TestCase):
     """The committed bundle must be browser-parseable and completely present."""
 

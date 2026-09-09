@@ -53,7 +53,12 @@ WARN = "warn"
 # Bundle-wide liveness budgets, in market hours (weekends and NYSE holidays are
 # not counted — publishing legitimately stops then).
 STALE_WARN_HOURS = 6.0
-STALE_FAIL_HOURS = 26.0
+# One session of silence is a warn; two is a fail. The publisher ticks several
+# times a session, so a full session with nothing landing already means it is
+# down. 26h (four sessions) let a dead publisher look merely slow for most of a
+# week -- it stopped on a Monday evening and the verdict did not turn red until
+# Thursday.
+STALE_FAIL_HOURS = 13.0
 # Spread between the newest and oldest build_time inside one bundle, in market
 # hours. Deliberately loose: the newest artifact refreshes every tick while
 # several others are on a daily cadence, so any daily artifact looks ~24h
@@ -198,12 +203,15 @@ def parse_ts(value) -> datetime | None:
 
 
 def finding(severity: str, code: str, artifact: str, detail: str,
-            observed=None, threshold=None) -> dict:
+            observed=None, threshold=None, **extra) -> dict:
     out = {"severity": severity, "code": code, "artifact": artifact, "detail": detail}
     if observed is not None:
         out["observed"] = observed
     if threshold is not None:
         out["threshold"] = threshold
+    # Extra context a specific check wants to hand the alerter (e.g. stale_days,
+    # which the issue title uses). Never part of the fingerprint.
+    out.update({k: v for k, v in extra.items() if v is not None})
     return out
 
 
@@ -323,12 +331,13 @@ def check_liveness(payloads: dict[str, object], now: datetime) -> list[dict]:
     newest_rel, newest = max(stamps.items(), key=lambda kv: kv[1])
     age = market_age_hours(newest, now)
     if age > STALE_FAIL_HOURS:
+        wall_days = max(0, (now - newest).days)
         findings.append(finding(
             FAIL, "bundle_not_publishing", "data/",
             f"newest artifact in the bundle ({newest_rel}) is {age:.1f} market-hours old "
-            f"({iso_z(newest)}). Publishing runs locally, so this usually means the "
-            "publisher stopped — the public site is serving stale data.",
-            observed=round(age, 1), threshold=STALE_FAIL_HOURS))
+            f"({iso_z(newest)}, {wall_days} days ago). Publishing runs locally, so this "
+            "usually means the publisher stopped — the public site is serving stale data.",
+            observed=round(age, 1), threshold=STALE_FAIL_HOURS, stale_days=wall_days))
     elif age > STALE_WARN_HOURS:
         findings.append(finding(
             WARN, "bundle_stale", "data/",
@@ -430,7 +439,50 @@ def _fingerprint(findings: list[dict]) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
 
 
-_MARKER_RE = re.compile(r"<!-- public-health fp=(?P<fp>\w+) verdict=(?P<verdict>\w+) -->")
+_MARKER_RE = re.compile(
+    r"<!-- public-health fp=(?P<fp>\w+) verdict=(?P<verdict>\w+)(?: day=(?P<day>[\d-]+))? -->")
+
+
+def _stale_days(findings: list[dict]) -> int | None:
+    """Days the bundle has been frozen, when a liveness finding reports it."""
+    for f in findings:
+        d = f.get("stale_days")
+        if isinstance(d, int):
+            return d
+    return None
+
+
+def alert_title(verdict: str, findings: list[dict]) -> str:
+    """Readable from a notification list without opening the issue."""
+    days = _stale_days(findings)
+    if days is not None:
+        plural = "" if days == 1 else "s"
+        return f"Public dashboard health: {verdict} — publisher stopped {days} day{plural} ago"
+    return f"Public dashboard health: {verdict} ({len(findings)} finding(s))"
+
+
+def should_speak(prev: dict | None, verdict: str, fp: str, today: str) -> tuple[bool, str]:
+    """
+    Suppressing repeat comments keeps a steady warn from becoming a spam feed.
+    But it also silenced a *fail*: once bundle_stale escalated to
+    bundle_not_publishing the fingerprint froze, and the watchdog said nothing
+    for three weeks while the site served three-week-old data. So:
+
+      - findings changed              -> speak (something is different)
+      - verdict got worse             -> speak (this is the escalation)
+      - unresolved fail, new day      -> speak (a daily nag, not silence)
+      - steady warn, same day         -> stay quiet
+    """
+    if prev is None:
+        return True, "first report"
+    if prev.get("fp") != fp:
+        return True, "findings changed"
+    rank = {"pass": 0, WARN: 1, FAIL: 2}
+    if rank.get(verdict, 0) > rank.get(prev.get("verdict") or "pass", 0):
+        return True, f"escalated {prev.get('verdict')} -> {verdict}"
+    if verdict == FAIL and prev.get("day") != today:
+        return True, "still failing"
+    return False, "unchanged"
 
 
 def cmd_check(args) -> int:
@@ -488,7 +540,8 @@ def cmd_alert(args) -> int:
     findings = report.get("findings", [])
     verdict = report.get("verdict", "pass")
     fp = _fingerprint(findings)
-    marker = f"<!-- public-health fp={fp} verdict={verdict} -->"
+    today = (report.get("checked_at") or "")[:10]
+    marker = f"<!-- public-health fp={fp} verdict={verdict} day={today} -->"
 
     if verdict == "pass":
         num = None if args.dry_run else open_issue()
@@ -501,7 +554,7 @@ def cmd_alert(args) -> int:
         print(f"closed issue #{num}" if proc.returncode == 0 else proc.stderr)
         return 0
 
-    title = f"Public dashboard health: {verdict} ({len(findings)} finding(s))"
+    title = alert_title(verdict, findings)
     body = "\n".join(
         [f"## Public bundle health — `{verdict}`", "",
          f"Checked `{report.get('checked_at')}` against baseline `{report.get('baseline')}`.", ""]
@@ -518,28 +571,47 @@ def cmd_alert(args) -> int:
 
     num = open_issue()
     if num is not None:
-        view = gh(["gh", "issue", "view", str(num), "--json", "comments,body"])
+        prev = None
+        prev_title = None
+        view = gh(["gh", "issue", "view", str(num), "--json", "comments,body,title"])
         if view.returncode == 0:
             try:
                 payload = json.loads(view.stdout or "{}")
+                prev_title = payload.get("title")
                 texts = [payload.get("body") or ""] + [
                     c.get("body") or "" for c in payload.get("comments") or []]
                 marks = [m.groupdict() for t in texts for m in _MARKER_RE.finditer(t)]
-                if marks and marks[-1].get("fp") == fp:
-                    print(f"issue #{num}: unchanged findings (fp={fp}) — no duplicate comment")
-                    return 0
+                prev = marks[-1] if marks else None
             except json.JSONDecodeError:
                 pass
+        # The title is what shows up in a notification list, so it must track the
+        # current verdict. Issue #3 sat at "warn (1 finding(s))" for three weeks
+        # while the bundle was three weeks stale.
+        if prev_title != title:
+            retitled = gh(["gh", "issue", "edit", str(num), "--title", title])
+            if retitled.returncode == 0:
+                print(f"issue #{num}: retitled to {title!r}")
+        speak, why = should_speak(prev, verdict, fp, today)
+        if not speak:
+            print(f"issue #{num}: {why} (fp={fp}) — no duplicate comment")
+            return 0
         proc = gh(["gh", "issue", "comment", str(num), "--body",
-                   f"**Update {report.get('checked_at')}** — `{verdict}`\n\n"
+                   f"**Update {report.get('checked_at')}** — `{verdict}` ({why})\n\n"
                    + "\n".join(f"- `{f['code']}` {f['artifact']} — {f['detail']}"
                                for f in findings[:30]) + f"\n\n{marker}"])
-        print(f"commented on issue #{num}" if proc.returncode == 0 else proc.stderr)
+        print(f"commented on issue #{num} ({why})" if proc.returncode == 0 else proc.stderr)
         return 0
     # gh refuses to create an issue with a label that does not exist yet.
     gh(["gh", "label", "create", ISSUE_LABEL, "--color", "D93F0B",
         "--description", "Public dashboard bundle health", "--force"])
-    proc = gh(["gh", "issue", "create", "--title", title, "--body", body, "--label", ISSUE_LABEL])
+    create = ["gh", "issue", "create", "--title", title, "--body", body,
+              "--label", ISSUE_LABEL]
+    # An unassigned issue in a one-person repo is a file nobody opens. Assigning
+    # it puts the watchdog in the owner's notifications and on their dashboard.
+    owner = (os.environ.get("GITHUB_REPOSITORY") or "").split("/")[0]
+    if owner:
+        create += ["--assignee", owner]
+    proc = gh(create)
     print(proc.stdout.strip() if proc.returncode == 0 else (proc.stderr or proc.stdout))
     return 0 if proc.returncode == 0 else proc.returncode
 
