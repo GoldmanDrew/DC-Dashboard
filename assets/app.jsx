@@ -1442,6 +1442,13 @@ async function loadEtfMetricsCache() {
   });
   ETF_METRICS_CACHE = {
     bySymbol,
+    // Union of every symbol's print dates = the observed NYSE session calendar.
+    // Realized-decay windows anchor to this instead of counting rows, so a fund
+    // that only prints twice a week gets a real 20-session window rather than
+    // its last 20 prints stretched across four months.
+    sessionDates: typeof RealizedDecayFns?.buildTradingCalendar === 'function'
+      ? RealizedDecayFns.buildTradingCalendar(rows)
+      : null,
     buildTime: payload?.build_time || null,
   };
   return ETF_METRICS_CACHE;
@@ -3207,6 +3214,35 @@ function SimpleSeriesPlot({
 const RealizedDecayFns = window.RealizedDecay || {};
 const REALIZED_DECAY_HORIZONS = RealizedDecayFns.DEFAULT_HORIZONS || [5, 20, 60, 120, 251];
 
+/**
+ * How much of the window its prints actually cover, e.g. "9/20 prints".
+ * Direxion names publish NAV ~2x a week, so a 20-session window holds ~9 prints.
+ * The period drag is still exact (log differences telescope to the endpoints),
+ * but a reader comparing it against a daily-printing fund deserves to know.
+ */
+function decayWindowCoverageLabel(h) {
+  if (!h || !Number.isFinite(Number(h.nominalTradingDays))) return null;
+  const obs = Number(h.obs);
+  if (!Number.isFinite(obs)) return null;
+  return `${obs}/${Number(h.nominalTradingDays)} prints`;
+}
+function decayWindowQualityLines(h) {
+  if (!h) return [];
+  const lines = [];
+  const cov = decayWindowCoverageLabel(h);
+  if (h.sparse && cov) {
+    lines.push(`Sparse: ${cov} in the window (${Math.round(Number(h.coveragePct) * 100)}% of sessions).`);
+    lines.push('Period drag telescopes to the endpoints, so the number is exact — it is just thinly sampled.');
+  }
+  if (Number.isFinite(Number(h.windowCalendarDays)) && Number.isFinite(Number(h.nominalCalendarDays))) {
+    lines.push(`Span: ${Number(h.windowCalendarDays)} calendar days (nominal ${Number(h.nominalCalendarDays)}).`);
+  }
+  if (Number.isFinite(Number(h.borrowDays))) {
+    lines.push(`Borrow billed on ${Number(h.borrowDays)} calendar days (Act/360).`);
+  }
+  return lines;
+}
+
 function fmtPxRange(start, end) {
   const a = Number(start);
   const b = Number(end);
@@ -3317,9 +3353,10 @@ function RealizedDecayHorizonsBarChart({ horizons, delta, borrowAnnual, etfLabel
             `${undLabel || 'Und'}: ${fmtPxRange(p.undStartPx, p.undEndPx)}`,
             `Gross: ${fmtPeriod(p.grossSimple)} (${fmtLogYr(p.grossLog)} log)`,
             `Net: ${fmtPeriod(p.netSimple)} (${fmtLogYr(p.netLog)} log, after borrow)`,
-            Number.isFinite(Number(borrowAnnual))
-              ? `Borrow drag: ${fmt(Number(borrowAnnual) * (p.obs / 252))} over period`
+            Number.isFinite(Number(borrowAnnual)) && Number.isFinite(Number(p.borrowDays))
+              ? `Borrow drag: ${fmt(Number(borrowAnnual) * (Number(p.borrowDays) / 360))} over period`
               : null,
+            ...decayWindowQualityLines(p),
             !p.sufficient
               ? (p.availableHistory
                 ? '(available history — listing shorter than longer horizons)'
@@ -3342,6 +3379,11 @@ function RealizedDecayHorizonsBarChart({ horizons, delta, borrowAnnual, etfLabel
               </div>
               <div className="decay-horizon-label">
                 {p.availableHistory ? `${p.obs}d*` : `${p.horizonDays}d`}
+                {p.sparse ? (
+                  <span className="decay-sparse-flag" title={`Thin coverage: ${decayWindowCoverageLabel(p) || 'few prints'}`}>
+                    {' '}◦{p.obs}
+                  </span>
+                ) : null}
               </div>
             </div>
           );
@@ -6488,15 +6530,25 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
     const c = Number(getBorrowRate(r));
     return Number.isFinite(c) ? c : 0;
   }, [etfBorrowSeries, r]);
+  // Session calendar for date-anchored decay windows. Prefer the one built with
+  // the metrics cache; rebuild from the map for callers that hydrated some other way.
+  const metricsSessionCalendar = useMemo(() => {
+    const cached = ETF_METRICS_CACHE?.sessionDates;
+    if (Array.isArray(cached) && cached.length) return cached;
+    return typeof RealizedDecayFns.buildTradingCalendar === 'function'
+      ? RealizedDecayFns.buildTradingCalendar(etfMetricsMap)
+      : null;
+  }, [etfMetricsMap]);
   const realizedDecayHorizonsRaw = useMemo(() => (
     typeof RealizedDecayFns.computeHorizonPeriodReturns === 'function'
       ? RealizedDecayFns.computeHorizonPeriodReturns(
         realizedDailyDragSeries,
         REALIZED_DECAY_HORIZONS,
         decayBorrowAnnual,
+        { calendar: metricsSessionCalendar },
       )
       : { horizons: [], nDays: 0, endDate: null }
-  ), [realizedDailyDragSeries, decayBorrowAnnual]);
+  ), [realizedDailyDragSeries, decayBorrowAnnual, metricsSessionCalendar]);
   const realizedDecayHorizons = useMemo(() => (
     typeof RealizedDecayFns.collapsePartialHorizons === 'function'
       ? RealizedDecayFns.collapsePartialHorizons(realizedDecayHorizonsRaw)
@@ -6533,9 +6585,10 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
         realizedDailyDragSeries,
         decayRollWindow,
         decayBorrowAnnual,
+        { calendar: metricsSessionCalendar },
       )
       : []
-  ), [realizedDailyDragSeries, decayRollWindow, decayBorrowAnnual]);
+  ), [realizedDailyDragSeries, decayRollWindow, decayBorrowAnnual, metricsSessionCalendar]);
   // Same source rule as volShapeHistoryForSymbol, and the same joint/contiguity
   // filter: this used to recompute off etfBacktestSeries while the grid path
   // went through jointMetricsRowsForVolShape, so the two could disagree for any
@@ -9127,6 +9180,14 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
                           ? `Available history (${h.obs}d)`
                           : `${h.horizonDays} trading days`}
                         {!h.sufficient && !h.availableHistory ? ' (partial)' : ''}
+                        {h.sparse ? (
+                          <span
+                            className="decay-sparse-flag"
+                            title={decayWindowQualityLines(h).join('\n')}
+                          >
+                            {' '}thin
+                          </span>
+                        ) : null}
                       </td>
                       <td style={{ color: h.grossSimple >= 0 ? 'var(--positive)' : 'var(--negative)', fontFamily: 'JetBrains Mono, monospace' }}>
                         {h.grossSimple != null && Number.isFinite(h.grossSimple) ? fmt(h.grossSimple) : '—'}
@@ -9137,8 +9198,15 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
                       <td style={{ fontFamily: 'JetBrains Mono, monospace', color: 'var(--text-muted)' }}>
                         {h.borrowLog != null && Number.isFinite(h.borrowLog) ? fmt(h.borrowLog) : '—'}
                       </td>
-                      <td style={{ color: 'var(--text-muted)', fontSize: 11 }}>
+                      <td
+                        style={{ color: 'var(--text-muted)', fontSize: 11 }}
+                        title={decayWindowQualityLines(h).join('\n') || undefined}
+                      >
                         {h.startDate && h.endDate ? `${h.startDate} → ${h.endDate}` : '—'}
+                        {Number.isFinite(Number(h.windowCalendarDays))
+                          ? ` · ${Number(h.windowCalendarDays)}d`
+                          : ''}
+                        {h.sparse ? ` · ${decayWindowCoverageLabel(h)}` : ''}
                         {!h.sufficient ? ' · partial' : ''}
                       </td>
                       {!isFoF ? (
@@ -9243,6 +9311,14 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
                           ? `Available history (${h.obs}d)`
                           : `${h.horizonDays} trading days`}
                         {!h.sufficient && !h.availableHistory ? ' (partial)' : ''}
+                        {h.sparse ? (
+                          <span
+                            className="decay-sparse-flag"
+                            title={decayWindowQualityLines(h).join('\n')}
+                          >
+                            {' '}thin
+                          </span>
+                        ) : null}
                       </td>
                       <td style={{ color: h.grossSimple >= 0 ? 'var(--positive)' : 'var(--negative)', fontFamily: 'JetBrains Mono, monospace' }}>
                         {h.grossSimple != null && Number.isFinite(h.grossSimple) ? fmt(h.grossSimple) : '—'}
@@ -9253,8 +9329,15 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
                       <td style={{ fontFamily: 'JetBrains Mono, monospace', color: 'var(--text-muted)' }}>
                         {h.borrowLog != null && Number.isFinite(h.borrowLog) ? fmt(h.borrowLog) : '—'}
                       </td>
-                      <td style={{ color: 'var(--text-muted)', fontSize: 11 }}>
+                      <td
+                        style={{ color: 'var(--text-muted)', fontSize: 11 }}
+                        title={decayWindowQualityLines(h).join('\n') || undefined}
+                      >
                         {h.startDate && h.endDate ? `${h.startDate} → ${h.endDate}` : '—'}
+                        {Number.isFinite(Number(h.windowCalendarDays))
+                          ? ` · ${Number(h.windowCalendarDays)}d`
+                          : ''}
+                        {h.sparse ? ` · ${decayWindowCoverageLabel(h)}` : ''}
                         {!h.sufficient ? ' · partial' : ''}
                       </td>
                       <td style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 11, whiteSpace: 'nowrap' }}>

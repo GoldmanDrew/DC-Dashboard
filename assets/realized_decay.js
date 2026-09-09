@@ -8,6 +8,21 @@
  *   period_gross_simple = expm1(period_gross_log)   // short-favorable +
  *   period_net_log = period_gross_log − borrow × (N/252) × (365/360)
  *
+ * Windows are anchored to TRADING DATES, not row counts. "20 trading days" means
+ * the 20 sessions before the last print, taken off a market calendar supplied by
+ * the caller (`options.calendar`) — not "the last 20 rows we happen to hold". The
+ * distinction is invisible for a fund that prints daily and enormous for one that
+ * does not: a Direxion name with ~2 issuer prints a week returned its last 20 rows
+ * as a "20 trading day" number spanning 113 calendar days. Because period drag is a
+ * sum of log differences it telescopes to the endpoint identity, so sparse sampling
+ * does not bias the sum — only the choice of window does. Callers that pass no
+ * calendar keep the legacy row-count slice.
+ *
+ * Every window reports what it actually measured: `obs` vs `nominalTradingDays`
+ * (`coveragePct`), `windowCalendarDays` vs `nominalCalendarDays` (`stretchRatio`),
+ * and a `sparse` flag when the prints cover less than SPARSE_WINDOW_COVERAGE of the
+ * sessions the label claims.
+ *
  * Calendar gaps > MAX_PAIR_DRAG_GAP_DAYS do not form a drag day (carry-forward stitches).
  * Large |drag| with near-perfect simple leverage tracking is flagged convexity_day
  * (log measure ≠ 0 under perfect −2× on huge moves) — never silently zeroed.
@@ -23,6 +38,13 @@
   // the quoted annual fee to a held-period drag needs the Act/360 surcharge 365/360 ~ 1.0139.
   const BORROW_ACT360_FACTOR = 365 / 360;
   const DEFAULT_HORIZONS = [5, 20, 60, 120, 251];
+  // Only used to describe a window when the caller supplies no market calendar:
+  // 5 sessions span 7 calendar days.
+  const CALENDAR_DAYS_PER_TRADING_DAY = 7 / 5;
+  // A window whose prints cover less than this share of the sessions its label
+  // claims is flagged `sparse`. The sum is still right (endpoint identity); it was
+  // just measured from far fewer prints than the reader would assume.
+  const SPARSE_WINDOW_COVERAGE = 0.8;
   const MAX_CONTIGUOUS_METRICS_GAP_DAYS = 45;
   const HARD_LIFECYCLE_GAP_DAYS = 365;
   // Skip pair-drag across holes larger than a long weekend. Carry-forward rows are
@@ -242,6 +264,10 @@
       }
       out.push({
         date: clean[i].date,
+        // The prior session this drag was measured from. `startDate` on a window
+        // is this, not the first observation's own date, so "window" and the
+        // start price printed beside it refer to the same session.
+        datePrev: clean[i - 1].date,
         drag,
         simplePnl: b * rUSimple - rLSimple,
         rU,
@@ -271,6 +297,89 @@
     return b * (n / TRADING_DAYS_PER_YEAR) * BORROW_ACT360_FACTOR;
   }
 
+  /**
+   * Borrow over a window whose real calendar length we know. Act/360 on days held,
+   * which is what both IBKR and Clear Street actually bill — no trading-day proxy.
+   *
+   * periodBorrowLog() infers calendar days from an observation count, so a window
+   * holding 20 prints across 113 days billed 20 days of carry. Prefer this whenever
+   * the window has dates.
+   */
+  function periodBorrowLogCalendar(borrowAnnual, calendarDays) {
+    const b = toNum(borrowAnnual);
+    const d = Math.max(0, Math.floor(toNum(calendarDays) || 0));
+    if (!Number.isFinite(b) || d <= 0) return 0;
+    return b * (d / 360);
+  }
+
+  /**
+   * Sorted unique session dates. Accepts a date array, a row array, or the
+   * symbol -> rows map the dashboard already holds; the union across every symbol
+   * is the observed market calendar.
+   */
+  function buildTradingCalendar(source) {
+    const seen = new Set();
+    const push = (v) => {
+      const d = parseDate(typeof v === "string" ? v : (v && v.date));
+      if (d) seen.add(d);
+    };
+    if (Array.isArray(source)) source.forEach(push);
+    else if (source && typeof source === "object") {
+      Object.keys(source).forEach((k) => {
+        const rows = source[k];
+        if (Array.isArray(rows)) rows.forEach(push);
+      });
+    }
+    return Array.from(seen).sort(xDateCmp);
+  }
+
+  function normalizeCalendar(calendar) {
+    if (!Array.isArray(calendar) || calendar.length < 2) return null;
+    return calendar;
+  }
+
+  /** Index of the last calendar session at or before `date`. -1 when none. */
+  function calendarIndexAtOrBefore(calendar, date) {
+    const d = parseDate(date);
+    if (!d) return -1;
+    let lo = 0;
+    let hi = calendar.length - 1;
+    let out = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (xDateCmp(calendar[mid], d) <= 0) { out = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    return out;
+  }
+
+  /**
+   * The session `horizonDays` back from `endDate`. Drag observations belong to the
+   * window when their date is strictly after the anchor, so the window covers
+   * exactly `horizonDays` sessions of price movement.
+   */
+  function resolveHorizonWindow(calendar, endDate, horizonDays) {
+    const cal = normalizeCalendar(calendar);
+    const h = Math.max(1, Math.floor(toNum(horizonDays) || 0));
+    if (!cal) return null;
+    const endIdx = calendarIndexAtOrBefore(cal, endDate);
+    if (endIdx < 0) return null;
+    const anchorIdx = endIdx - h;
+    return {
+      anchorDate: cal[Math.max(0, anchorIdx)],
+      // False when the calendar itself does not reach back a full horizon.
+      complete: anchorIdx >= 0,
+      sessionsAvailable: endIdx,
+    };
+  }
+
+  /** First index in `series` whose date falls strictly after `anchorDate`. */
+  function firstIndexAfter(series, anchorDate) {
+    for (let i = 0; i < series.length; i += 1) {
+      if (xDateCmp(parseDate(series[i] && series[i].date), anchorDate) > 0) return i;
+    }
+    return series.length;
+  }
+
   function slicePeriodMetrics(drags, dailySeries, startIdx, endIdx, borrowAnnual) {
     const slice = drags.slice(startIdx, endIdx + 1);
     const obs = slice.length;
@@ -281,7 +390,12 @@
         netLog: null,
         netSimple: null,
         borrowLog: null,
+        borrowDays: 0,
+        borrowBasis: null,
         obs: 0,
+        startDate: null,
+        endDate: null,
+        windowCalendarDays: null,
         etfStartPx: null,
         etfEndPx: null,
         undStartPx: null,
@@ -291,10 +405,18 @@
       };
     }
     const grossLog = slice.reduce((a, x) => a + x, 0);
-    const borrowLog = periodBorrowLog(borrowAnnual, obs);
-    const netLog = grossLog - borrowLog;
     const startRow = dailySeries[startIdx] || {};
     const endRow = dailySeries[endIdx] || {};
+    const startDate = parseDate(startRow.datePrev) || parseDate(startRow.date) || null;
+    const endDate = parseDate(endRow.date) || null;
+    const windowCalendarDays = startDate && endDate ? dateGapDays(startDate, endDate) : NaN;
+    // Carry is billed per calendar day held. Only fall back to the observation
+    // count when the window has no usable dates to measure.
+    const useCalendarBorrow = Number.isFinite(windowCalendarDays) && windowCalendarDays > 0;
+    const borrowLog = useCalendarBorrow
+      ? periodBorrowLogCalendar(borrowAnnual, windowCalendarDays)
+      : periodBorrowLog(borrowAnnual, obs);
+    const netLog = grossLog - borrowLog;
     const windowRows = dailySeries.slice(startIdx, endIdx + 1);
     const convexityRows = windowRows.filter((r) => r && r.convexityDay);
     const convexityDragLog = convexityRows.reduce((a, r) => a + toNum(r.drag), 0);
@@ -304,9 +426,12 @@
       netLog,
       netSimple: logToSimplePeriod(netLog),
       borrowLog,
+      borrowDays: useCalendarBorrow ? windowCalendarDays : obs,
+      borrowBasis: useCalendarBorrow ? "calendar_act_360" : "observation_count",
       obs,
-      startDate: startRow.date ? String(startRow.date) : null,
-      endDate: endRow.date ? String(endRow.date) : null,
+      startDate,
+      endDate,
+      windowCalendarDays: Number.isFinite(windowCalendarDays) ? windowCalendarDays : null,
       etfStartPx: toNum(startRow.etfPxPrev),
       etfEndPx: toNum(endRow.etfPx),
       undStartPx: toNum(startRow.undPxPrev),
@@ -316,22 +441,53 @@
     };
   }
 
-  function computeHorizonPeriodReturns(dailySeries, horizons, borrowAnnual) {
+  /**
+   * Period gross/net by horizon.
+   *
+   * `options.calendar` is a market session calendar (see buildTradingCalendar) --
+   * pass it and each horizon becomes the real trailing window of that many
+   * sessions. Omit it and the legacy "last h rows" slice is used, which only
+   * agrees with the label when the symbol prints every session.
+   */
+  function computeHorizonPeriodReturns(dailySeries, horizons, borrowAnnual, options) {
     const hs = Array.isArray(horizons) && horizons.length ? horizons : DEFAULT_HORIZONS;
     const series = Array.isArray(dailySeries) ? dailySeries : [];
     const drags = series.map((x) => toNum(x && x.drag)).filter(Number.isFinite);
     const n = drags.length;
     const endDate = n ? String(series[n - 1].date || "") : null;
     const meta = series._meta || {};
+    const calendar = normalizeCalendar(options && options.calendar);
     const rows = hs.map((hRaw) => {
       const h = Math.max(1, Math.floor(toNum(hRaw) || 0));
-      const startIdx = Math.max(0, n - h);
+      const win = calendar ? resolveHorizonWindow(calendar, endDate, h) : null;
+      const startIdx = win ? firstIndexAfter(series, win.anchorDate) : Math.max(0, n - h);
       const endIdx = n - 1;
       const m = slicePeriodMetrics(drags, series, startIdx, endIdx, borrowAnnual);
+      const nominalCalendarDays = win
+        ? dateGapDays(win.anchorDate, endDate)
+        : Math.round(h * CALENDAR_DAYS_PER_TRADING_DAY);
+      // Do the prints actually reach back to where the label says the window starts?
+      const reachesAnchor = win
+        ? Boolean(m.startDate) && xDateCmp(m.startDate, win.anchorDate) <= 0
+        : m.obs >= h;
+      const coveragePct = m.obs > 0 && h > 0 ? m.obs / h : 0;
+      const stretchRatio = Number.isFinite(m.windowCalendarDays)
+        && Number.isFinite(nominalCalendarDays) && nominalCalendarDays > 0
+        ? m.windowCalendarDays / nominalCalendarDays
+        : null;
       return {
         horizonDays: h,
         ...m,
-        sufficient: m.obs >= h,
+        windowMode: win ? "trading_date" : "observation_count",
+        anchorDate: win ? win.anchorDate : null,
+        nominalTradingDays: h,
+        nominalCalendarDays: Number.isFinite(nominalCalendarDays) ? nominalCalendarDays : null,
+        coveragePct,
+        stretchRatio,
+        // The number is still the true drag over the window it reports; `sparse`
+        // says it was measured from far fewer prints than the label implies.
+        sparse: m.obs > 0 && coveragePct < SPARSE_WINDOW_COVERAGE,
+        sufficient: Boolean(win ? win.complete && reachesAnchor : reachesAnchor) && m.obs > 0,
       };
     });
     return {
@@ -340,6 +496,7 @@
       endDate,
       borrowAnnual: toNum(borrowAnnual),
       pairDragBasis: PAIR_DRAG_BASIS,
+      windowMode: calendar ? "trading_date" : "observation_count",
       skippedGaps: meta.skippedGaps || [],
       convexityDays: meta.convexityDays || [],
     };
@@ -365,17 +522,40 @@
     return { ...horizonResult, horizons: out, collapsedPartials: partial.length };
   }
 
-  function buildRollingPeriodReturnSeries(dailySeries, windowDays, borrowAnnual) {
+  /**
+   * Rolling w-session period return. With `options.calendar` each point is a real
+   * trailing w-session window, so a symbol that prints twice a week still plots
+   * (it simply holds fewer prints inside each window) instead of dropping out
+   * entirely for want of w consecutive rows.
+   */
+  function buildRollingPeriodReturnSeries(dailySeries, windowDays, borrowAnnual, options) {
     const w = Math.max(1, Math.floor(toNum(windowDays) || 60));
     const series = Array.isArray(dailySeries) ? dailySeries : [];
     const drags = series.map((x) => toNum(x && x.drag));
+    const calendar = normalizeCalendar(options && options.calendar);
     const out = [];
-    for (let endIdx = w - 1; endIdx < series.length; endIdx += 1) {
-      const startIdx = endIdx - w + 1;
+    for (let endIdx = calendar ? 0 : w - 1; endIdx < series.length; endIdx += 1) {
+      const win = calendar ? resolveHorizonWindow(calendar, series[endIdx].date, w) : null;
+      let startIdx;
+      if (win) {
+        if (!win.complete) continue;
+        startIdx = firstIndexAfter(series, win.anchorDate);
+        if (startIdx > endIdx) continue;
+        const anchored = parseDate(series[startIdx] && series[startIdx].datePrev);
+        // Only plot a point whose prints actually span the window.
+        if (!anchored || xDateCmp(anchored, win.anchorDate) > 0) continue;
+      } else {
+        startIdx = endIdx - w + 1;
+      }
       const dragSlice = drags.slice(startIdx, endIdx + 1).filter(Number.isFinite);
-      if (dragSlice.length < w) continue;
+      if (!dragSlice.length || (!win && dragSlice.length < w)) continue;
       const grossLog = dragSlice.reduce((a, x) => a + x, 0);
-      const borrowLog = periodBorrowLog(borrowAnnual, w);
+      const startDate = parseDate(series[startIdx] && series[startIdx].datePrev);
+      const endDate = parseDate(series[endIdx] && series[endIdx].date);
+      const spanDays = startDate && endDate ? dateGapDays(startDate, endDate) : NaN;
+      const borrowLog = Number.isFinite(spanDays) && spanDays > 0
+        ? periodBorrowLogCalendar(borrowAnnual, spanDays)
+        : periodBorrowLog(borrowAnnual, w);
       const netLog = grossLog - borrowLog;
       out.push({
         date: String(series[endIdx].date || ""),
@@ -384,6 +564,8 @@
         gross_log: grossLog,
         net_log: netLog,
         windowDays: w,
+        obs: dragSlice.length,
+        windowCalendarDays: Number.isFinite(spanDays) ? spanDays : null,
       });
     }
     return out;
@@ -403,6 +585,7 @@
     TRADING_DAYS_PER_YEAR,
     BORROW_ACT360_FACTOR,
     DEFAULT_HORIZONS,
+    SPARSE_WINDOW_COVERAGE,
     MAX_CONTIGUOUS_METRICS_GAP_DAYS,
     HARD_LIFECYCLE_GAP_DAYS,
     MAX_PAIR_DRAG_GAP_DAYS,
@@ -423,6 +606,9 @@
     buildRollingPeriodReturnSeries,
     logToSimplePeriod,
     periodBorrowLog,
+    periodBorrowLogCalendar,
+    buildTradingCalendar,
+    resolveHorizonWindow,
     etfTrPrice,
     undTrPrice,
     ...reexport,
