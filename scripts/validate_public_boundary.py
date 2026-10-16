@@ -6,9 +6,13 @@ import json
 import re
 from pathlib import Path
 
+import etf_metrics_format as emf
+
 
 ROOT = Path(__file__).resolve().parents[1]
-MAX_FILE_BYTES = 40 * 1024 * 1024
+# Cloudflare Pages rejects any single file over 25 MiB ("Pages only supports
+# files up to 25 MiB"). Fail here, before the deploy step, with headroom.
+MAX_FILE_BYTES = 20 * 1024 * 1024
 ALLOWED_TOP_LEVEL = {
     ".claude",
     ".git",
@@ -126,6 +130,19 @@ def _assert_borrow_sign_convention(payload: dict) -> None:
         )
 
 
+def _json_keys(value: object) -> set[str]:
+    found: set[str] = set()
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            found.update(str(key) for key in current)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return found
+
+
 def _walk_json(value: object, rel: str) -> None:
     stack = [value]
     while stack:
@@ -206,8 +223,13 @@ def validate() -> None:
         seen.add(rel)
         if rel in FORBIDDEN_FILES or FORBIDDEN_PATH_PARTS.intersection(path.parts):
             raise AssertionError(f"private path in public repository: {rel}")
-        if path.stat().st_size > MAX_FILE_BYTES:
-            raise AssertionError(f"oversized public file: {rel}")
+        size = path.stat().st_size
+        if size > MAX_FILE_BYTES:
+            raise AssertionError(
+                f"oversized public file: {rel} is {size / (1024 * 1024):.2f} MiB; "
+                "Cloudflare Pages rejects files over 25 MiB, so deploys fail "
+                f"closed at {MAX_FILE_BYTES / (1024 * 1024):.0f} MiB"
+            )
         if rel == "scripts/validate_public_boundary.py":
             continue
         if path.suffix.lower() in {".html", ".js", ".json", ".csv", ".md", ".yml", ".yaml"}:
@@ -269,8 +291,25 @@ def validate() -> None:
             raise AssertionError(f"manifest checksum mismatch: {item['path']}")
 
     metrics = json.loads((ROOT / "data/etf_metrics_daily.json").read_text(encoding="utf-8"))
-    metric_rows = metrics.get("rows") if isinstance(metrics, dict) else None
-    if not isinstance(metric_rows, list) or not metric_rows:
+    if not isinstance(metrics, dict) or metrics.get("format") != emf.FORMAT:
+        raise AssertionError(
+            "etf_metrics_daily.json must be columnar_v1 so it stays under the "
+            "Cloudflare Pages 25 MiB file cap. The private exporter "
+            "(Diamond-Creek-Execution export_public_dashboard, the "
+            "'publish sanitized dashboard bundle (local runner)' commit) has to "
+            "write that shape; see scripts/etf_metrics_format.py."
+        )
+    leaked = _json_keys(metrics) & set(emf.PROVENANCE_KEYS)
+    if leaked:
+        raise AssertionError(
+            "etf_metrics_daily.json still has pipeline provenance: "
+            + ", ".join(sorted(leaked))
+        )
+    try:
+        metric_rows = emf.expand_columnar(metrics)
+    except emf.MetricsFormatError as exc:
+        raise AssertionError(f"etf_metrics_daily.json: {exc}") from exc
+    if not metric_rows:
         raise AssertionError("etf_metrics_daily.json has no rows")
     metric_dates = [
         str(row.get("date") or "")[:10]

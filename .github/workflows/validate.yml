@@ -37,3 +37,6 @@ jobs:
           for test_file in tests/*.js; do
             node "$test_file"
           done
+          for test_file in tests/test_*.py; do
+            python "$test_file"
+          done
