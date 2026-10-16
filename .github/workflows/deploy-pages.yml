@@ -20,6 +20,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Also rejects any deployed file over 20 MiB, under Cloudflare Pages'
+      # 25 MiB per-file cap. etf_metrics_daily.json crossed that cap at run 684.
       - name: Validate public boundary
         run: python scripts/validate_public_boundary.py
       # Never deploy a bundle that does not match its source: index.html loads

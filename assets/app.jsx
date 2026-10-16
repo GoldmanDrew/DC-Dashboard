@@ -21,8 +21,9 @@ const VrpUi = window.VrpUi || {};
 //
 // Every data fetch used to be `?t=<clock bucket>` with `cache: 'no-store'`,
 // which forbids the browser from storing the response at all. The app eagerly
-// loads ~54MB of JSON on mount (etf_metrics_daily 16MB, vol_shape_history 13MB,
-// letf_rebalance_flows_daily 12MB, dashboard_data 10MB), so every visit re-paid
+// loads the public JSON bundle on mount (etf_metrics_daily is columnar so it
+// stays under the Pages per-file cap; vol_shape_history, letf rebalance flows,
+// and dashboard_data are the other large files), so every visit re-paid
 // the full download and, worse, the full main-thread JSON.parse -- and the
 // dashboard_data leg re-ran on every tab refocus.
 //
@@ -1428,7 +1429,14 @@ async function loadEtfMetricsCache() {
   const res = await fetchData(ETF_METRICS_DAILY_URL);
   if (!res.ok) throw new Error(`etf metrics HTTP ${res.status}`);
   const payload = await res.json();
-  const rows = (Array.isArray(payload?.rows) ? payload.rows : [])
+  const expand = window.EtfMetricsFormat && window.EtfMetricsFormat.expand;
+  if (typeof expand !== 'function') {
+    throw new Error('ETF metrics format helper failed to load');
+  }
+  // columnar_v1 stores field names once. expand() restores row objects,
+  // copying close_price back into etf_adj_close where the export omitted an
+  // exact duplicate. Legacy row arrays still expand, so an older file loads.
+  const rows = expand(payload)
     .filter((row) => isNyseSessionDateString(row?.date) && !isIssuerEarlyMetricsRow(row));
   const bySymbol = {};
   rows.forEach((row) => {

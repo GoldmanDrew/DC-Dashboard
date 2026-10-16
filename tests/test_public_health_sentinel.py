@@ -142,6 +142,31 @@ class RecordCountTests(unittest.TestCase):
         self.assertIsNone(phs.count_records({"other": []}, "records"))
         self.assertIsNone(phs.count_records([], "records"))
         self.assertIsNone(phs.count_records({"records": 5}, "records"))
+        self.assertEqual(phs.count_records({"columns": {"date": ["a", "b"]}}, "rows"), 2)
+        self.assertEqual(
+            phs.count_records({"rows": [1], "columns": {"date": [1, 2, 3]}}, "rows"), 1)
+
+    def test_columnar_compaction_is_not_a_byte_regression(self):
+        old = {"rows": list(range(20))}
+        new = {"columns": {"date": ["2026-01-01"] * 20}}
+        out = phs.compare_artifact(
+            "data/etf_metrics_daily.json", "rows",
+            new_bytes=1_000, old_bytes=100_000, new_payload=new, old_payload=old)
+        self.assertEqual(out, [])
+
+    def test_byte_drop_without_a_held_record_count_still_fails(self):
+        out = phs.compare_artifact(
+            "data/x.json", None,
+            new_bytes=1_000, old_bytes=100_000, new_payload={}, old_payload={})
+        self.assertEqual([f["code"] for f in out], ["byte_size_regression"])
+
+    def test_record_drop_still_fails(self):
+        old = {"rows": list(range(20))}
+        new = {"rows": [1, 2]}
+        out = phs.compare_artifact(
+            "data/etf_metrics_daily.json", "rows",
+            new_bytes=80_000, old_bytes=100_000, new_payload=new, old_payload=old)
+        self.assertEqual([f["code"] for f in out], ["record_count_regression"])
 
 
 class ManifestCoverageTests(unittest.TestCase):

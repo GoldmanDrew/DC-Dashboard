@@ -69,6 +69,12 @@ SKEW_WARN_HOURS = 48.0
 # previous published bundle is a regression the manifest cannot detect.
 RECORD_DROP_FRAC = 0.50
 BYTE_DROP_FRAC = 0.60
+# A byte drop past BYTE_DROP_FRAC is truncation when the record count cannot
+# be shown to have held. Columnar compaction of etf_metrics_daily shrinks the
+# file by well over 60% while keeping every observation; that is not a
+# regression. Require the counted series to be essentially intact (not merely
+# above the 50% loss line) before trusting the byte shrink.
+RECORD_HOLD_FRAC = 0.98
 
 # Collection locator per artifact, for record-count regression. Mirrors the
 # shapes the browser actually consumes; anything absent here is still size- and
@@ -242,15 +248,54 @@ def data_tree_dirty() -> bool:
     return proc.returncode != 0
 
 
-def count_records(payload, locator: str | None) -> int | None:
-    if not locator or not isinstance(payload, dict):
-        return None
-    node = payload
+def _lookup(payload: dict, locator: str):
+    node: object = payload
     for part in locator.split("."):
         if not isinstance(node, dict) or part not in node:
             return None
         node = node[part]
+    return node
+
+
+def count_records(payload, locator: str | None) -> int | None:
+    """Length of the collection at ``locator``.
+
+    ``rows`` also accepts columnar_v1 metrics (``columns.date``) so a format
+    change that keeps the series is not reported as losing every record.
+    """
+    if not locator or not isinstance(payload, dict):
+        return None
+    node = _lookup(payload, locator)
+    if node is None and locator == "rows":
+        node = _lookup(payload, "columns.date")
     return len(node) if isinstance(node, (list, dict)) else None
+
+
+def compare_artifact(rel: str, locator: str | None, new_bytes: int, old_bytes: int,
+                     new_payload: object, old_payload: object) -> list[dict]:
+    """Byte and record-count regression of one file against the previous bundle."""
+    findings: list[dict] = []
+    old_n = count_records(old_payload, locator) if isinstance(old_payload, dict) else None
+    new_n = count_records(new_payload, locator) if isinstance(new_payload, dict) else None
+    records_held = (
+        isinstance(old_n, int) and isinstance(new_n, int)
+        and old_n >= 10
+        and new_n >= old_n * RECORD_HOLD_FRAC
+    )
+    if not records_held and old_bytes > 4096 and new_bytes < old_bytes * (1.0 - BYTE_DROP_FRAC):
+        findings.append(finding(
+            FAIL, "byte_size_regression", rel,
+            f"shrank {old_bytes:,}B -> {new_bytes:,}B versus the previous published "
+            f"bundle (>{BYTE_DROP_FRAC:.0%} drop)",
+            observed=new_bytes, threshold=int(old_bytes * (1.0 - BYTE_DROP_FRAC))))
+    if old_n and new_n is not None and old_n >= 10 and new_n < old_n * (1.0 - RECORD_DROP_FRAC):
+        findings.append(finding(
+            FAIL, "record_count_regression", rel,
+            f"{locator} fell {old_n} -> {new_n} versus the previous published bundle "
+            f"(>{RECORD_DROP_FRAC:.0%} drop) — hashes still match, so only this "
+            "comparison can catch it",
+            observed=new_n, threshold=int(old_n * (1.0 - RECORD_DROP_FRAC))))
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -374,28 +419,15 @@ def check_regression(payloads: dict[str, object], baseline: str) -> list[dict]:
         path = ROOT / rel
         new_bytes = path.stat().st_size
         old_bytes = len(raw)
-        if old_bytes > 4096 and new_bytes < old_bytes * (1.0 - BYTE_DROP_FRAC):
-            findings.append(finding(
-                FAIL, "byte_size_regression", rel,
-                f"shrank {old_bytes:,}B -> {new_bytes:,}B versus the previous published "
-                f"bundle (>{BYTE_DROP_FRAC:.0%} drop)",
-                observed=new_bytes, threshold=int(old_bytes * (1.0 - BYTE_DROP_FRAC))))
         locator = RECORD_LOCATORS.get(rel)
-        if not locator:
-            continue
+        old_payload: object = None
         try:
             old_payload = json.loads(raw.decode("utf-8"))
         except Exception:
-            continue
-        old_n = count_records(old_payload, locator)
-        new_n = count_records(payload, locator)
-        if old_n and new_n is not None and old_n >= 10 and new_n < old_n * (1.0 - RECORD_DROP_FRAC):
-            findings.append(finding(
-                FAIL, "record_count_regression", rel,
-                f"{locator} fell {old_n} -> {new_n} versus the previous published bundle "
-                f"(>{RECORD_DROP_FRAC:.0%} drop) — hashes still match, so only this "
-                "comparison can catch it",
-                observed=new_n, threshold=int(old_n * (1.0 - RECORD_DROP_FRAC))))
+            old_payload = None
+        findings.extend(compare_artifact(
+            rel, locator, new_bytes, old_bytes, payload, old_payload,
+        ))
     return findings
 
 
