@@ -39,7 +39,8 @@ import os
 import re
 import subprocess
 import sys
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,20 +51,19 @@ ISSUE_LABEL = "ops/public-health"
 FAIL = "fail"
 WARN = "warn"
 
-# Bundle-wide liveness budgets, in market hours (weekends and NYSE holidays are
-# not counted — publishing legitimately stops then).
+# Bundle-wide liveness budgets, in NYSE regular-session hours (09:30–16:00
+# America/New_York). Weekends, full-day holidays, and off-hours are not
+# counted — publishing legitimately stops then.
 STALE_WARN_HOURS = 6.0
-# One session of silence is a warn; two is a fail. The publisher ticks several
-# times a session, so a full session with nothing landing already means it is
-# down. 26h (four sessions) let a dead publisher look merely slow for most of a
-# week -- it stopped on a Monday evening and the verdict did not turn red until
-# Thursday.
+# One session of silence is a warn; two is a fail. A session is 6.5h, so 13h
+# is two full sessions. The publisher ticks several times a session, so a full
+# session with nothing landing already means it is down. 26h was four sessions,
+# long enough that a stop on Monday evening stayed a warn for most of the week.
 STALE_FAIL_HOURS = 13.0
-# Spread between the newest and oldest build_time inside one bundle, in market
-# hours. Deliberately loose: the newest artifact refreshes every tick while
-# several others are on a daily cadence, so any daily artifact looks ~24h
-# "behind" by the end of a session. This must catch *frozen*, not *slower* —
-# two full trading days without a refresh.
+# Spread between the newest and oldest build_time inside one bundle, in
+# regular-session hours. Deliberately loose: the newest artifact refreshes
+# every tick while several others are on a daily cadence, so a daily artifact
+# is about one session behind. This must catch *frozen*, not *slower*.
 SKEW_WARN_HOURS = 48.0
 # A published artifact losing more than this share of its records against the
 # previous published bundle is a regression the manifest cannot detect.
@@ -174,18 +174,44 @@ def is_session(d: date) -> bool:
     return d.weekday() < 5 and d not in nyse_holidays(d.year)
 
 
+# Regular session only. Early closes are irrelevant at these hour budgets.
+NY_TZ = ZoneInfo("America/New_York")
+SESSION_OPEN = time(9, 30)
+SESSION_CLOSE = time(16, 0)
+
+
+def _as_utc(dt: datetime) -> datetime:
+    return dt.astimezone(UTC) if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
 def market_age_hours(ts: datetime, now: datetime) -> float:
-    """Elapsed hours excluding whole non-session days."""
+    """Elapsed NYSE regular-session hours between ``ts`` and ``now``.
+
+    Only 09:30–16:00 America/New_York on a session day counts. Weekends,
+    full-day holidays, and the hours outside that window do not, including a
+    weekend or holiday that is still in progress. Dropping 24h for non-session
+    days strictly between the two dates left the current Saturday (and Monday
+    before the open, and the morning after a holiday) billed in full.
+    """
+    ts = _as_utc(ts)
+    now = _as_utc(now)
     if ts >= now:
         return 0.0
-    hours = (now - ts).total_seconds() / 3600.0
-    d = ts.date() + timedelta(days=1)
-    skipped = 0
-    while d < now.date():
-        if not is_session(d):
-            skipped += 1
-        d += timedelta(days=1)
-    return max(0.0, hours - 24.0 * skipped)
+    start = ts.astimezone(NY_TZ)
+    end = now.astimezone(NY_TZ)
+    total = 0.0
+    day = start.date()
+    last = end.date()
+    while day <= last:
+        if is_session(day):
+            open_dt = datetime.combine(day, SESSION_OPEN, tzinfo=NY_TZ)
+            close_dt = datetime.combine(day, SESSION_CLOSE, tzinfo=NY_TZ)
+            lo = start if start > open_dt else open_dt
+            hi = end if end < close_dt else close_dt
+            if hi > lo:
+                total += (hi - lo).total_seconds() / 3600.0
+        day += timedelta(days=1)
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -390,8 +416,8 @@ def check_liveness(payloads: dict[str, object], now: datetime) -> list[dict]:
             observed=round(age, 1), threshold=STALE_WARN_HOURS))
 
     oldest_rel, oldest = min(stamps.items(), key=lambda kv: kv[1])
-    # Market hours, not wall clock: an artifact last built on Friday is ~5h behind
-    # a Monday bundle, not 53h. Wall-clock skew fires every Monday for nothing.
+    # Regular-session hours, not wall clock. Friday's close versus a Monday
+    # bundle is only as old as Monday's session so far — the weekend is not age.
     skew = market_age_hours(oldest, newest)
     if skew > SKEW_WARN_HOURS:
         findings.append(finding(

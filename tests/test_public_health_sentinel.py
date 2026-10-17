@@ -44,13 +44,13 @@ class CalendarTests(unittest.TestCase):
         self.assertFalse(phs.is_session(date(2026, 8, 8)))   # Saturday
         self.assertFalse(phs.is_session(date(2026, 8, 9)))   # Sunday
 
-    def test_market_age_excludes_whole_non_session_days(self):
+    def test_market_age_counts_the_open_window_only(self):
+        # Friday 17:00 EDT (after the close) to Monday 10:00 EDT. The old
+        # formula billed raw wall-clock minus 48h = 17h, which is Friday
+        # evening plus Monday pre-open. Only 09:30–10:00 Monday counts.
         friday = datetime(2026, 8, 7, 21, 0, tzinfo=UTC)
         monday = datetime(2026, 8, 10, 14, 0, tzinfo=UTC)
-        raw = (monday - friday).total_seconds() / 3600.0
-        aged = phs.market_age_hours(friday, monday)
-        self.assertAlmostEqual(raw - 48.0, aged, places=6)
-        self.assertLess(aged, 24.0)
+        self.assertAlmostEqual(phs.market_age_hours(friday, monday), 0.5, places=6)
 
     def test_future_timestamp_is_zero_age(self):
         now = datetime(2026, 8, 10, 14, 0, tzinfo=UTC)
@@ -73,6 +73,105 @@ class BrowserStrictParseTests(unittest.TestCase):
         self.assertEqual(phs.load_browser_strict(p)["a"], 1.5)
 
 
+class SessionClockTests(unittest.TestCase):
+    """Age is NYSE regular-session time, and the 6h/13h budgets stay put.
+
+    Dropping 24h only for non-session days strictly between the artifact and
+    today billed the in-progress Saturday in full. That failed every weekend
+    (issue #14, and the same alarm on Sep 26, Oct 3, and Oct 9) and the same
+    way on Monday before the open and the morning after a holiday.
+    """
+
+    # The bundle that opened issue #14: Friday 16:24 EDT, after the close.
+    FRIDAY_CLOSE = "2026-10-16T20:24:58Z"
+
+    def _findings(self, build: str, now: datetime) -> list[dict]:
+        return phs.check_liveness({"data/a.json": {"build_time": build}}, now)
+
+    def _codes(self, build: str, now: datetime) -> list[str]:
+        return [f["code"] for f in self._findings(build, now)]
+
+    def test_saturday_after_the_close_is_not_stale(self):
+        # Public-health run that opened #14, 2026-10-17 17:56Z. Wall clock was
+        # 21.5h and Saturday was not subtracted, so the verdict was fail.
+        now = datetime(2026, 10, 17, 17, 56, 14, tzinfo=UTC)
+        self.assertAlmostEqual(
+            phs.market_age_hours(phs.parse_ts(self.FRIDAY_CLOSE), now), 0.0, places=6)
+        self.assertEqual(self._codes(self.FRIDAY_CLOSE, now), [])
+
+    def test_sunday_after_the_close_is_not_stale(self):
+        now = datetime(2026, 10, 18, 18, 0, tzinfo=UTC)
+        self.assertEqual(self._codes(self.FRIDAY_CLOSE, now), [])
+
+    def test_monday_pre_open_is_not_stale(self):
+        now = datetime(2026, 10, 19, 13, 0, tzinfo=UTC)  # 09:00 EDT
+        self.assertAlmostEqual(
+            phs.market_age_hours(phs.parse_ts(self.FRIDAY_CLOSE), now), 0.0, places=6)
+        self.assertEqual(self._codes(self.FRIDAY_CLOSE, now), [])
+
+    def test_monday_after_open_with_stale_data_fails(self):
+        # Silent since the Wednesday close. Thursday and Friday are two full
+        # sessions (13.0h). Weekend hours must not add to that, so Monday
+        # before the open is a warn; Monday 10:00 EDT is 13.5h and fails.
+        # The fail threshold is still 13.
+        build = "2026-10-14T20:00:00Z"  # Wed 16:00 EDT
+        pre = datetime(2026, 10, 19, 13, 0, tzinfo=UTC)   # Mon 09:00 EDT
+        after = datetime(2026, 10, 19, 14, 0, tzinfo=UTC)  # Mon 10:00 EDT
+        self.assertAlmostEqual(phs.market_age_hours(phs.parse_ts(build), pre), 13.0, places=6)
+        self.assertEqual(self._codes(build, pre), ["bundle_stale"])
+        out = self._findings(build, after)
+        self.assertEqual([f["code"] for f in out], ["bundle_not_publishing"])
+        self.assertEqual(out[0]["severity"], phs.FAIL)
+        self.assertEqual(out[0]["observed"], 13.5)
+        self.assertEqual(out[0]["threshold"], 13.0)
+
+    def test_holiday_and_the_next_morning_are_not_stale(self):
+        # Labor Day 2026-09-07. A Friday close must not warn or fail on the
+        # holiday itself, or on Tuesday before the open.
+        build = "2026-09-04T20:24:00Z"  # Fri 16:24 EDT
+        holiday = datetime(2026, 9, 7, 17, 56, tzinfo=UTC)  # Mon 13:56 EDT
+        morning = datetime(2026, 9, 8, 13, 0, tzinfo=UTC)   # Tue 09:00 EDT
+        opened = datetime(2026, 9, 8, 14, 0, tzinfo=UTC)    # Tue 10:00 EDT
+        self.assertFalse(phs.is_session(holiday.astimezone(phs.NY_TZ).date()))
+        self.assertEqual(self._codes(build, holiday), [])
+        self.assertEqual(self._codes(build, morning), [])
+        # Half an hour into the next session. The holiday contributes nothing.
+        self.assertAlmostEqual(
+            phs.market_age_hours(phs.parse_ts(build), opened), 0.5, places=6)
+        self.assertEqual(self._codes(build, opened), [])
+
+    def test_fail_budget_is_still_thirteen_session_hours(self):
+        self.assertEqual(phs.STALE_FAIL_HOURS, 13.0)
+        self.assertEqual(phs.STALE_WARN_HOURS, 6.0)
+        # Died at the Wednesday open. Exactly two sessions later is not yet a
+        # fail; six minutes into the next session (13.1h) is.
+        build = "2026-10-14T13:30:00Z"  # Wed 09:30 EDT
+        at_two = datetime(2026, 10, 15, 20, 0, tzinfo=UTC)   # Thu 16:00 EDT
+        over = datetime(2026, 10, 16, 13, 36, tzinfo=UTC)    # Fri 09:36 EDT
+        self.assertAlmostEqual(phs.market_age_hours(phs.parse_ts(build), at_two), 13.0, places=6)
+        self.assertEqual(self._codes(build, at_two), ["bundle_stale"])
+        out = self._findings(build, over)
+        self.assertEqual(out[0]["code"], "bundle_not_publishing")
+        self.assertEqual(out[0]["severity"], phs.FAIL)
+        self.assertEqual(out[0]["observed"], 13.1)
+        self.assertEqual(out[0]["threshold"], phs.STALE_FAIL_HOURS)
+
+    def test_winter_monday_pre_open_uses_eastern_standard_time(self):
+        # 2026-11-09 14:00 UTC is 09:00 EST, before the open. A fixed EDT
+        # offset would treat it as 10:00 and count half an hour.
+        build = "2026-11-06T21:30:00Z"  # Fri 16:30 EST, after the close
+        now = datetime(2026, 11, 9, 14, 0, tzinfo=UTC)
+        self.assertAlmostEqual(phs.market_age_hours(phs.parse_ts(build), now), 0.0, places=6)
+        self.assertEqual(self._codes(build, now), [])
+
+    def test_hours_after_the_close_do_not_accumulate(self):
+        start = datetime(2026, 10, 16, 18, 0, tzinfo=UTC)  # Fri 14:00 EDT
+        close = datetime(2026, 10, 16, 20, 0, tzinfo=UTC)  # Fri 16:00 EDT
+        saturday = datetime(2026, 10, 17, 18, 0, tzinfo=UTC)
+        self.assertAlmostEqual(phs.market_age_hours(start, close), 2.0, places=6)
+        self.assertAlmostEqual(phs.market_age_hours(start, saturday), 2.0, places=6)
+
+
 class LivenessTests(unittest.TestCase):
     NOW = datetime(2026, 8, 10, 17, 0, tzinfo=UTC)  # Monday
 
@@ -93,10 +192,13 @@ class LivenessTests(unittest.TestCase):
         self.assertEqual(out[0]["severity"], phs.FAIL)
 
     def test_mildly_stale_warns_but_does_not_fail(self):
+        # Friday 11:30 EDT through Monday 13:00 EDT is 8.0 session hours:
+        # past one session, short of two.
         out = phs.check_liveness(
-            self._payloads({"data/a.json": "2026-08-10T08:00:00Z"}), self.NOW)
+            self._payloads({"data/a.json": "2026-08-07T15:30:00Z"}), self.NOW)
         self.assertEqual([f["code"] for f in out], ["bundle_stale"])
         self.assertEqual(out[0]["severity"], phs.WARN)
+        self.assertEqual(out[0]["observed"], 8.0)
 
     def test_daily_cadence_artifact_does_not_trip_skew_over_a_weekend(self):
         # Regression guard: an artifact last built Saturday is ~29 wall-clock
