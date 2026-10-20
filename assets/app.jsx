@@ -721,6 +721,29 @@ const fmtSharesAvail = (v) => {
   return n.toLocaleString();
 };
 
+/** Net carry: realized intercept carry minus borrow minus hedge financing, simple %/yr, 1 dp. */
+const fmtNetCarry = v => {
+  if (v == null || !Number.isFinite(Number(v))) return '\u2014';
+  const n = Number(v) * 100;
+  return (n >= 0 ? '+' : '') + n.toFixed(1) + '%';
+};
+/** Tooltip for the Net carry cell: the decomposition and the fit behind it. */
+function netCarryTooltip(r) {
+  if (r == null || r.net_carry_annual == null) return 'Net carry: not available for this screener run.';
+  const c = Number(r.carry_arith_annual);
+  const se = Number(r.carry_se_annual);
+  const n = Number(r.carry_n_obs);
+  const srcRaw = String(r.carry_source || '');
+  const src = srcRaw === 'ols_shrunk'
+    ? 'fitted, shrunk toward the vol-quartile prior'
+    : (srcRaw === 'prior_only' ? 'prior only (short history)' : (srcRaw || '\u2014'));
+  return [
+    `Net carry ${fmtNetCarry(r.net_carry_annual)}/yr on short notional`,
+    `= carry ${fmtNetCarry(c)} \u00b1 ${Number.isFinite(se) ? (se * 100).toFixed(1) + '%' : '\u2014'} \u2212 borrow \u2212 |\u03b4| \u00d7 4.3% hedge financing`,
+    `carry = \u2212intercept of OLS(r_ETF on \u03b4\u00b7r_U), trailing 252 sessions, simple returns; ${Number.isFinite(n) ? n + ' obs, ' : ''}${src}`,
+    'What a daily-rehedged short of this fund actually earned (fees, swap financing, tracking shortfall). Not the \u03c3\u00b2 log-drag edge.',
+  ].join('\n');
+}
 const fmtPct = v => {
   if (v == null || !Number.isFinite(Number(v))) return '—';
   const n = Number(v) * 100;
@@ -3422,6 +3445,14 @@ const COLS = [
     sublabel: 'best estimate · band',
     w: 130,
     hint: 'Best estimate of annual edge after borrow, short-favorable + (log/yr). Inverse-variance Bayesian blend: posterior = w_forward × Exp. edge (fwd) p50 + (1 − w_forward) × realized history, minus borrow. YieldBOOST anchor is put-spread structural gross (weekly pair MC is diagnostic-only). Box p25–p75, whisker p5–p95, dot p50.',
+  },
+  {
+    key: 'net_carry_annual',
+    label: 'Net carry',
+    sublabel: 'realized \u00b7 after costs',
+    w: 112,
+    numeric: true,
+    hint: 'Regression-intercept carry (what a daily-rehedged short of this fund earned over the trailing year: fees, swap financing, tracking shortfall) minus posterior borrow minus |\u03b4| \u00d7 4.3% hedge financing. Simple %/yr on short notional, shrunk toward a vol-quartile prior. Hover for carry \u00b1 se, observations and source. Distinct from Net edge (\u03c3\u00b2 log-drag model).',
   },
   {
     key: 'realized_pair_gross_20d',
@@ -13425,6 +13456,12 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
                           ) : (
                             <NetEdgeMergedCell r={r} />
                           )}
+                        </td>
+                        <td
+                          className={grossShortFavCls(Number(r?.net_carry_annual))}
+                          title={netCarryTooltip(r)}
+                        >
+                          {fmtNetCarry(r?.net_carry_annual)}
                         </td>
                         <td
                           className={grossShortFavCls(Number(r?.realized_pair_gross_20d))}
