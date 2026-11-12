@@ -737,12 +737,154 @@ function netCarryTooltip(r) {
   const src = srcRaw === 'ols_shrunk'
     ? 'fitted, shrunk toward the vol-quartile prior'
     : (srcRaw === 'prior_only' ? 'prior only (short history)' : (srcRaw || '\u2014'));
+  const pct = (v, dp = 1) => (v == null || !Number.isFinite(Number(v)) ? '\u2014' : (Number(v) * 100).toFixed(dp) + '%');
+  const debit = r.carry_debit_rate_annual;
+  const frac = r.carry_debit_borrowed_frac;
+  const charge = r.carry_borrow_charge_annual;
+  const delta = Math.abs(Number(r.delta));
+  const debitLine = debit != null
+    ? `debit: |\u03b4| ${Number.isFinite(delta) ? delta.toFixed(2) : '\u2014'} \u00d7 ${pct(debit, 2)}`
+      + (frac != null ? ` (contractual rate \u00d7 ${pct(frac, 0)} of longs borrowed)` : '')
+    : 'debit: |\u03b4| \u00d7 the debit rate on borrowed longs (rate not in this build)';
+  const borrowBits = [];
+  // Cost-positive: a negative number is a rebate, which the carry does not credit.
+  const cost = (v) => (Number(v) < 0 ? `${pct(-Number(v))} credit` : pct(v));
+  if (r.borrow_quote_cost_annual != null) borrowBits.push(`quote ${cost(r.borrow_quote_cost_annual)}`);
+  if (r.borrow_charged_annual != null) borrowBits.push(`charged ${cost(r.borrow_charged_annual)}`);
+  if (charge != null) borrowBits.push(`in the carry ${pct(charge)}`);
+  const feed = r.borrow_feed_source ? ` \u00b7 sized on the ${r.borrow_feed_source}` : '';
+  const from = r.net_carry_source === 'plan'
+    ? 'From the trade plan: the number this name is weighted on.'
+    : (r.net_carry_source === 'screener' ? 'From the screener (this name is not in the plan).' : null);
   return [
     `Net carry ${fmtNetCarry(r.net_carry_annual)}/yr on short notional`,
-    `= carry ${fmtNetCarry(c)} \u00b1 ${Number.isFinite(se) ? (se * 100).toFixed(1) + '%' : '\u2014'} \u2212 borrow \u2212 |\u03b4| \u00d7 4.3% hedge financing`,
+    `= carry ${fmtNetCarry(c)} \u00b1 ${Number.isFinite(se) ? (se * 100).toFixed(1) + '%' : '\u2014'} \u2212 borrow charge \u2212 debit`,
+    borrowBits.length ? `borrow: ${borrowBits.join(' \u00b7 ')}${feed}` : null,
+    debitLine,
     `carry = \u2212intercept of OLS(r_ETF on \u03b4\u00b7r_U), trailing 252 sessions, simple returns; ${Number.isFinite(n) ? n + ' obs, ' : ''}${src}`,
-    'What a daily-rehedged short of this fund actually earned (fees, swap financing, tracking shortfall). Not the \u03c3\u00b2 log-drag edge.',
-  ].join('\n');
+    from,
+    'What a daily-rehedged short of this fund actually earned (fees, swap financing, tracking shortfall). Not the \u03c3\u00b2 log-drag model edge.',
+  ].filter(Boolean).join('\n');
+}
+
+// \u2500\u2500 Sizing: the score each sleeve is weighted on \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// Buckets 1 and 2 are weighted on net carry and bucket 3 on its harvest edge.
+// The model edge (net_edge_p50_annual) sizes nothing; whether it is still an
+// admission bar is the config's call, shown only when `sizing_gates` has an
+// `edge` gate. The bars, the sleeve targets and the debit come from `sizing_policy` in
+// dashboard_data.json, which the data build reads from config/sizing.yaml;
+// nothing here is a copy of a threshold.
+const sizingBucket = (r) => String(r?.screener_bucket || r?.bucket || '');
+const isHarvestSized = (r) => sizingBucket(r) === 'bucket_3' && r?.b3_edge != null;
+/** Harvest edge for bucket 3, net carry otherwise. Null when the build has neither. */
+function sizingScore(r) {
+  const v = isHarvestSized(r) ? r.b3_edge : r?.net_carry_annual;
+  return v == null || !Number.isFinite(Number(v)) ? null : Number(v);
+}
+function sizingScoreTooltip(r) {
+  if (!isHarvestSized(r)) return netCarryTooltip(r);
+  const pct = (v) => (v == null || !Number.isFinite(Number(v)) ? '\u2014' : (Number(v) * 100).toFixed(1) + '%');
+  return [
+    `Harvest edge ${fmtNetCarry(r.b3_edge)}/yr: the score bucket 3 is weighted on.`,
+    `harvest ${pct(r.b3_harvest)} = \u00bd\u00b7L\u00b7(L+1)\u00b7\u03c3\u00b2\u00b7(1 \u2212 VR), with VR ${r.b3_vr14 != null ? Number(r.b3_vr14).toFixed(3) : '\u2014'} (14-day variance ratio of the underlier; below 1 = it chops)`,
+    'minus borrow, financing and turnover, plus the hedge credit.',
+    r.b3_admitted === false ? 'Not admitted on this edge today.' : null,
+    'Bucket 3 does not size on net carry or on the model edge.',
+  ].filter(Boolean).join('\n');
+}
+/** Highest sizing scores among names the plan may trade; planned names first on a tie. */
+function topSizingScores(records, n) {
+  return (records || [])
+    .filter((r) => sizingScore(r) != null && r.execution_eligible !== false && !r.strategy_blacklisted)
+    .sort((a, b) => sizingScore(b) - sizingScore(a) || (b.sizing_in_plan ? 1 : 0) - (a.sizing_in_plan ? 1 : 0))
+    .slice(0, n);
+}
+const sizingGate = (r, name) => (Array.isArray(r?.sizing_gates) ? r.sizing_gates.find((g) => g.gate === name) : null) || null;
+const gatePct = (v) => (v == null || !Number.isFinite(Number(v)) ? '\u2014' : (Number(v) * 100).toFixed(0) + '%');
+/** A held name needs the keep bar, a new one the entry bar. */
+function gatePasses(g, held) {
+  if (!g || g.status === 'unknown') return null;
+  return g.status === 'entry' || (held && g.status === 'keep_only');
+}
+function gateTitle(g, held) {
+  if (!g) return '';
+  const isRatio = g.gate === 'borrow_vs_carry';
+  const show = (v) => (isRatio ? (v == null ? '\u2014' : Number(v).toFixed(2) + '\u00d7') : (v == null ? '\u2014' : (Number(v) * 100).toFixed(1) + '%'));
+  const verdict = g.status === 'unknown' ? 'no value' : (g.status === 'entry' ? 'clears the entry bar'
+    : (g.status === 'keep_only' ? 'clears the keep bar only' : 'below both bars'));
+  return `${g.label}: ${show(g.value)} \u00b7 entry ${show(g.entry)} / keep ${show(g.keep)} \u00b7 ${verdict}`
+    + ` \u00b7 judged as ${held ? 'held (keep bar)' : 'new (entry bar)'}`;
+}
+const GATE_SHORT = { edge: 'edge', carry: 'carry', decay: 'decay', borrow_vs_carry: 'borrow', harvest: 'harvest' };
+function SizingCell({ r }) {
+  const gates = Array.isArray(r?.sizing_gates) ? r.sizing_gates : [];
+  const held = r?.sizing_in_plan === true;
+  if (!gates.length && !held) return <span style={{ color: 'var(--text-muted)' }}>{'\u2014'}</span>;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 2, lineHeight: 1.25 }}>
+      <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
+        {gates.map((g) => {
+          const ok = gatePasses(g, held);
+          const kind = ok == null ? 'badge-stale' : (ok ? (g.status === 'entry' ? 'badge-good' : 'badge-warn') : 'badge-bad');
+          return (
+            <span key={g.gate} className={`badge ${kind}`} style={{ fontSize: 9 }} title={gateTitle(g, held)}>
+              {GATE_SHORT[g.gate] || g.gate}{ok == null ? ' ?' : (ok ? ' \u2713' : ' \u2717')}
+            </span>
+          );
+        })}
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--text-muted)' }} title={held
+        ? (r.sizing_binding_note ? `In the plan. Its size is set by ${r.sizing_binding_note}.` : 'In the plan.')
+        : 'Not in the plan: judged on the entry bars.'}>
+        {held ? (r.sizing_binding ? `in plan \u00b7 ${r.sizing_binding}` : 'in plan') : 'not in plan'}
+      </div>
+    </div>
+  );
+}
+/** One line under the model-edge band when the config has a model-edge bar; nothing otherwise. */
+function ModelEdgeBar({ r }) {
+  const g = sizingGate(r, 'edge');
+  if (!g) return null;
+  const held = r?.sizing_in_plan === true;
+  const ok = gatePasses(g, held);
+  return (
+    <div style={{ fontSize: 9, color: ok === false ? 'var(--negative)' : 'var(--text-muted)', marginTop: 1 }} title={gateTitle(g, held)}>
+      bar {gatePct(g.entry)} new / {gatePct(g.keep)} held{ok == null ? '' : (ok ? ' \u2713' : ' \u2717')}
+    </div>
+  );
+}
+function SizingPolicyStrip({ policy }) {
+  if (!policy) return null;
+  const t = policy.sleeve_targets || {};
+  const w = policy.weight_score || {};
+  const b1 = (policy.bars || {}).bucket_1 || {};
+  const b2 = (policy.bars || {}).bucket_2 || {};
+  const b3 = (policy.bars || {}).bucket_3 || {};
+  const pct = (v, dp = 1) => (v == null || !Number.isFinite(Number(v)) ? '\u2014' : (Number(v) * 100).toFixed(dp) + '%');
+  const score = (col) => (col === 'net_carry_for_sizing' ? 'net carry' : (col === 'b3_edge' ? 'harvest edge' : (col === 'net_edge_p50_annual' ? 'model edge' : String(col || '\u2014'))));
+  const item = { whiteSpace: 'nowrap' };
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 18px', fontSize: 11, color: 'var(--text-muted)', padding: '6px 2px 10px' }}
+      title={`Read from ${policy.source || 'config/sizing.yaml'} by the data build${policy.plan_date ? ` \u00b7 plan of ${policy.plan_date}` : ''}`}>
+      <span style={item}><strong style={{ color: 'var(--text)' }}>Sleeve targets</strong> B1 {pct(t.bucket_1)} {'\u00b7'} B2 {pct(t.bucket_2)} {'\u00b7'} B3 {pct(t.bucket_3)}</span>
+      <span style={item}><strong style={{ color: 'var(--text)' }}>Weighted on</strong> B1 {score(w.bucket_1)} {'\u00b7'} B2 {score(w.bucket_2)} {'\u00b7'} B3 {score(w.bucket_3)}</span>
+      <span style={item}><strong style={{ color: 'var(--text)' }}>B1 bars</strong>
+        {b1.edge_entry != null ? ` model edge ${gatePct(b1.edge_entry)} new / ${gatePct(b1.edge_keep)} held \u00b7` : ''}
+        {b1.carry_entry != null ? ` carry ${gatePct(b1.carry_entry)} / ${gatePct(b1.carry_keep)} \u00b7` : ''}
+        {b1.decay_entry != null ? ` decay ${gatePct(b1.decay_entry)} / ${gatePct(b1.decay_keep)}` : ''}
+        {b1.vr_haircut ? ' \u00b7 trend haircut on new names at VR > 1' : ''}</span>
+      <span style={item}><strong style={{ color: 'var(--text)' }}>B2 bars</strong>
+        {b2.carry_entry != null ? ` carry ${gatePct(b2.carry_entry)} / ${gatePct(b2.carry_keep)}` : ''}
+        {b2.borrow_gate_line != null ? ` \u00b7 borrow \u2265 ${gatePct(b2.borrow_gate_line)} needs carry \u2265 ${b2.borrow_gate_entry_mult}\u00d7 / ${b2.borrow_gate_keep_mult}\u00d7 borrow` : ''}</span>
+      <span style={item}><strong style={{ color: 'var(--text)' }}>B3</strong>
+        {b3.harvest_entry != null ? ` harvest ${gatePct(b3.harvest_entry)} / ${gatePct(b3.harvest_keep)}` : ''}
+        {b3.tail_cap_frac_of_sleeve != null ? ` \u00b7 tail cap ${pct(b3.tail_cap_frac_of_sleeve)} of sleeve` : ''}</span>
+      {policy.debit_rate_annual != null ? (
+        <span style={item}><strong style={{ color: 'var(--text)' }}>Debit</strong> {pct(policy.debit_rate_annual, 2)}
+          {policy.debit_borrowed_frac != null ? ` (${pct(policy.debit_borrowed_frac, 0)} of longs borrowed \u00d7 ${pct(policy.debit_contractual_annual, 1)})` : ''}</span>
+      ) : null}
+    </div>
+  );
 }
 const fmtPct = v => {
   if (v == null || !Number.isFinite(Number(v))) return '—';
@@ -3436,23 +3578,30 @@ const COLS = [
   { key: 'underlying', label: 'Underlying', w: 85 },
   { key: 'delta', label: 'Delta', w: 65, hint: 'ls-algo hedge δ: OLS on aligned daily simple returns vs underlying TR, shrunk toward listed leverage (AR(1)-adjusted n_eff).' },
   { key: 'borrow_current', label: 'Borrow', w: 118, sublabel: 'spot · outlook', hint: 'Borrow outlook: spot Clear Street rate (short_favorable_positive: negative = fee). Sublabel = stress tier / thin-history / 5D drift when present. HIGH/MED = fee magnitude; SPIKE/↑ = v1 (or L2) stress.' },
-  { key: 'shares_available', label: 'Shares Avail', w: 100, hint: 'IBKR shares available imported as an availability-only proxy. This is not a borrow-rate source.' },
+  { key: 'shares_available', label: 'Shares (IBKR)', sublabel: 'proxy · not a size input', w: 104, hint: 'IBKR retail shares available, shown for context only. We clear at Clear Street: nothing is sized, gated or margined on this count. Short capacity is Clear Street’s locate decision and our own locate history; the Sizing column says when locate supply is what holds a name.' },
   { key: 'gross_decay_annual', label: 'Gross (realiz.)', w: 100, sublabel: 'trailing', hint: 'Realized: trailing annualized hedge drag from ls-algo screener (δ·r_U − r_ETF) × 252. Not the forward Exp. edge (fwd) column.' },
   { key: 'expected_pair_pnl_p50_annual', label: 'Exp. edge (fwd)', sublabel: 'struct · 1Y log/yr', w: 128, hint: 'Forward structural gross decay before borrow (log/yr). YieldBOOST: screener put-spread MC — same anchor as Net edge and Scenarios heatmap. LETF/inverse/vol-ETP: vol-drag identity. Sub-row: p10/p90 band. Hover for vol sensitivity and weekly pair MC diagnostic.' },
   {
-    key: 'net_edge_p50_annual',
-    label: 'Net edge',
-    sublabel: 'best estimate · band',
-    w: 130,
-    hint: 'Best estimate of annual edge after borrow, short-favorable + (log/yr). Inverse-variance Bayesian blend: posterior = w_forward × Exp. edge (fwd) p50 + (1 − w_forward) × realized history, minus borrow. YieldBOOST anchor is put-spread structural gross (weekly pair MC is diagnostic-only). Box p25–p75, whisker p5–p95, dot p50.',
-  },
-  {
     key: 'net_carry_annual',
     label: 'Net carry',
-    sublabel: 'realized \u00b7 after costs',
-    w: 112,
+    sublabel: 'sizing score · after costs',
+    w: 118,
     numeric: true,
-    hint: 'Regression-intercept carry (what a daily-rehedged short of this fund earned over the trailing year: fees, swap financing, tracking shortfall) minus posterior borrow minus |\u03b4| \u00d7 4.3% hedge financing. Simple %/yr on short notional, shrunk toward a vol-quartile prior. Hover for carry \u00b1 se, observations and source. Distinct from Net edge (\u03c3\u00b2 log-drag model).',
+    hint: 'The score the sleeve is weighted on. Buckets 1 and 2: regression-intercept carry (what a daily-rehedged short of this fund earned over the trailing year: fees, swap financing, tracking shortfall) minus the borrow charge minus |δ| × the debit rate on borrowed longs. Simple %/yr on short notional. For a name in the plan this is the plan’s own number. Bucket 3 rows show the harvest edge instead (marked “harvest”): that sleeve does not size on carry. Hover for the parts.',
+  },
+  {
+    key: 'sizing_state',
+    label: 'Sizing',
+    sublabel: 'live bars · what binds',
+    w: 150,
+    hint: 'Each live admission bar for the sleeve, read from the plan config: a held name is judged on the keep bar, a new one on the entry bar. Green = clears the entry bar, amber = clears the keep bar only, red = fails. The second line says whether the name is in the plan and what holds its size: weight, liquidity, locate or tail.',
+  },
+  {
+    key: 'net_edge_p50_annual',
+    label: 'Model edge',
+    sublabel: 'not a sizing input · band',
+    w: 130,
+    hint: 'The log-drag model edge after borrow, short-favorable + (log/yr). It sizes nothing and is research context: a daily-rehedged pair earns roughly a quarter of it. If the plan config carries a model-edge admission bar for the sleeve, the line under the band shows it; with no line, admission is on net carry. Inverse-variance Bayesian blend: posterior = w_forward × Exp. edge (fwd) p50 + (1 − w_forward) × realized history, minus borrow. YieldBOOST anchor is put-spread structural gross (weekly pair MC is diagnostic-only). Box p25–p75, whisker p5–p95, dot p50.',
   },
   {
     key: 'realized_pair_gross_20d',
@@ -4134,10 +4283,36 @@ function DetailRow({ r, chartVolLookbackRange, dashboardBuildTime, metricsCacheT
               <div className="detail-item-hint">No hist. avg → gross − spot borrow only.</div>
             )}
           </div>
+          <div className="detail-item" title={sizingScoreTooltip(r)}>
+            <div className="dlabel">{isHarvestSized(r) ? 'Harvest edge (sizing score)' : 'Net carry (sizing score)'}</div>
+            <div className={cls('dval', grossShortFavCls(Number(sizingScore(r))))}>{fmtNetCarry(sizingScore(r))}</div>
+            <div className="detail-item-hint">
+              {isHarvestSized(r)
+                ? `VR ${r.b3_vr14 != null ? Number(r.b3_vr14).toFixed(3) : '—'} · harvest ${fmtNetCarry(r.b3_harvest)}`
+                : (r.carry_debit_rate_annual != null
+                  ? `debit ${(Number(r.carry_debit_rate_annual) * 100).toFixed(2)}% × |δ| · borrow charge ${r.carry_borrow_charge_annual != null ? (Number(r.carry_borrow_charge_annual) * 100).toFixed(1) + '%' : '—'}`
+                  : 'carry − borrow − debit')}
+              <br />
+              {r.net_carry_source === 'plan' ? 'from the trade plan' : (r.net_carry_source === 'screener' ? 'from the screener (not in plan)' : '')}
+            </div>
+          </div>
           <div className="detail-item">
-            <div className="dlabel">Shares avail.</div>
-            <div className="dval">{fmtNum(r.shares_available)}</div>
-            <div className="detail-item-hint">IBKR availability proxy</div>
+            <div className="dlabel">Sizing</div>
+            <div className="dval" style={{ fontSize: 12 }}>
+              {r.sizing_in_plan ? `In plan${r.sizing_binding ? ` · held by ${r.sizing_binding}` : ''}` : 'Not in plan'}
+            </div>
+            <div className="detail-item-hint">
+              {r.sizing_in_plan && r.sizing_binding_note ? <>size set by {r.sizing_binding_note}<br /></> : null}
+              {(Array.isArray(r.sizing_gates) ? r.sizing_gates : []).map((g) => (
+                <React.Fragment key={g.gate}>{gateTitle(g, r.sizing_in_plan === true)}<br /></React.Fragment>
+              ))}
+              {r.vr14 != null && !isHarvestSized(r) ? `underlier VR(14d) ${Number(r.vr14).toFixed(3)}${Number(r.vr14) > 1 ? ' · trending' : ''}` : null}
+            </div>
+          </div>
+          <div className="detail-item">
+            <div className="dlabel">Shares (IBKR proxy)</div>
+            <div className="dval" style={{ color: 'var(--text-muted)' }}>{fmtNum(r.shares_available)}</div>
+            <div className="detail-item-hint">Display only. Not a size input: capacity is Clear Street’s locate decision.</div>
           </div>
           <div className="detail-item">
             <div className="dlabel">Delta (n = {fmtNum(r.delta_n_obs)})</div>
@@ -7841,6 +8016,41 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
           <>
           {/* Stats Grid — vol / decay / edge aligned with main table (COLS) */}
           <div className="chart-stats" style={{ marginTop: 0 }}>
+            {/* What the sleeve sizes on comes first: score, debit, what binds. */}
+            <div className="chart-stat" title={sizingScoreTooltip(r)}>
+              <div className="cs-label">{isHarvestSized(r) ? 'Harvest edge' : 'Net carry'}</div>
+              <div className={cls('cs-value', grossShortFavCls(Number(sizingScore(r))))}>{fmtNetCarry(sizingScore(r))}</div>
+              <div className="cs-sub">
+                sizing score{r.net_carry_source === 'plan' ? ' · from the plan' : (r.net_carry_source === 'screener' ? ' · screener' : '')}
+              </div>
+            </div>
+            {!isHarvestSized(r) ? (
+              <div className="chart-stat" title="Debit charged per $ of hedge: the contractual Clear Street rate times the share of long market value above NAV. Short proceeds do not offset it.">
+                <div className="cs-label">Debit rate</div>
+                <div className="cs-value">{r.carry_debit_rate_annual != null ? (Number(r.carry_debit_rate_annual) * 100).toFixed(2) + '%' : '—'}</div>
+                <div className="cs-sub">
+                  {r.carry_debit_borrowed_frac != null ? `${(Number(r.carry_debit_borrowed_frac) * 100).toFixed(0)}% of longs borrowed` : 'on borrowed longs'}
+                  {Number.isFinite(Number(r.delta)) && r.carry_debit_rate_annual != null
+                    ? ` · costs ${(Math.abs(Number(r.delta)) * Number(r.carry_debit_rate_annual) * 100).toFixed(1)}%/yr here` : ''}
+                </div>
+              </div>
+            ) : (
+              <div className="chart-stat" title="14-day variance ratio of the underlier, shrunk toward its group prior. Below 1 the underlier chops and the harvest is positive.">
+                <div className="cs-label">Variance ratio</div>
+                <div className="cs-value">{r.b3_vr14 != null ? Number(r.b3_vr14).toFixed(3) : '—'}</div>
+                <div className="cs-sub">harvest {fmtNetCarry(r.b3_harvest)}</div>
+              </div>
+            )}
+            <div className="chart-stat" title={r.sizing_binding_note ? `Size set by ${r.sizing_binding_note}.` : undefined}>
+              <div className="cs-label">Held by</div>
+              <div className="cs-value" style={{ fontSize: 15 }}>{r.sizing_in_plan ? (r.sizing_binding || 'in plan') : 'not in plan'}</div>
+              <div className="cs-sub">
+                {(Array.isArray(r.sizing_gates) ? r.sizing_gates : []).map((g) => {
+                  const ok = gatePasses(g, r.sizing_in_plan === true);
+                  return `${GATE_SHORT[g.gate] || g.gate} ${ok == null ? '?' : (ok ? '✓' : '✗')}`;
+                }).join(' · ') || 'no live bars in this build'}
+              </div>
+            </div>
             <div className="chart-stat">
               <div className="cs-label">Delta</div>
               <div className="cs-value">{r.delta?.toFixed(3) ?? '—'}</div>
@@ -7859,10 +8069,10 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
                 {borrowDisp.differs ? ' · tail ≠ grid' : ''}
               </div>
             </div>
-            <div className="chart-stat">
-              <div className="cs-label">Shares Avail</div>
-              <div className="cs-value">{fmtNum(r.shares_available)}</div>
-              <div className="cs-sub">IBKR availability proxy</div>
+            <div className="chart-stat" title="IBKR retail availability, display only. Nothing is sized, gated or margined on it.">
+              <div className="cs-label">Shares (IBKR proxy)</div>
+              <div className="cs-value" style={{ color: 'var(--text-muted)' }}>{fmtNum(r.shares_available)}</div>
+              <div className="cs-sub">not a size input</div>
             </div>
             <div className="chart-stat">
               <div className="cs-label">Gross (realiz.)</div>
@@ -7919,13 +8129,16 @@ function ChartPage({ record, onBack, chartVolLookbackRange, setChartVolLookbackR
                 );
               })()}
             </div>
-            <div className="chart-stat" style={{ minWidth: 140 }}>
-              <div className="cs-label">Net edge</div>
-              <div className="cs-sub" style={{ marginBottom: 2, textTransform: 'none', letterSpacing: 0 }}>forward · median · range</div>
+            <div className="chart-stat" style={{ minWidth: 140 }} title="The log-drag model edge. It sizes nothing. A line under the band appears only when the plan config still has a model-edge admission bar.">
+              <div className="cs-label">Model edge</div>
+              <div className="cs-sub" style={{ marginBottom: 2, textTransform: 'none', letterSpacing: 0 }}>not a sizing input · median · range</div>
               {isPassiveLowDeltaRow(r) ? (
                 <span title={PASSIVE_LOW_DELTA_POLICY_TOOLTIP} style={{ color: 'var(--text-muted)' }}>—</span>
               ) : (
-                <NetEdgeMergedCell r={r} />
+                <>
+                  <NetEdgeMergedCell r={r} />
+                  <ModelEdgeBar r={r} />
+                </>
               )}
             </div>
             {(() => {
@@ -11060,7 +11273,7 @@ function YbEdgePage({ onNavigateToChart, onBack, eventCalendar = null, vrpFieldD
               <Th k="short_signal_rank" label="Conviction" align="left" hint="Top / Good / Thin / Skip; No locate when no Clear Street shares." />
               <Th k="yb_etf" label="Fund" align="left" hint={fieldHint('yb_etf')} />
               <Th k="underlying" label="U" align="left" hint={fieldHint('underlying')} />
-              <Th k="net_edge_p50_annual" label="Short edge %/yr" hint="Median annual edge of shorting this ETF." />
+              <Th k="net_edge_p50_annual" label="Model edge %/yr" hint="Median annual model edge of shorting this ETF (log-drag model). Research context: the book is admitted and weighted on net carry, not on this." />
               <Th k="net_edge_band" label="Edge range" align="center" hint="p05–p95; red when low end &lt; 0." />
               <Th k="sync_rank" label="Fresh" align="center" hint="yes = aligned timestamps; stale = mixed." />
               <Th k="short_directly_shortable" label="Locate" align="center" hint="yes = borrowable now; no = purgatory / no shares." />
@@ -12638,7 +12851,7 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('all');
   const [search, setSearch] = useState('');
-  const [sortKey, setSortKey] = useState('net_edge_p50_annual');
+  const [sortKey, setSortKey] = useState('net_carry_annual');
   const [sortDesc, setSortDesc] = useState(true);
   const [expandedSym, setExpandedSym] = useState(null);
   const [showInfo, setShowInfo] = useState(false);
@@ -12987,6 +13200,10 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
         ? volHeadlineValue(a, 'underlying', chartVolLookbackRange)
         : sortKey === 'vol_etf_annual'
         ? volHeadlineValue(a, 'etf', chartVolLookbackRange)
+        : sortKey === 'net_carry_annual'
+        ? sizingScore(a)
+        : sortKey === 'sizing_state'
+        ? (a.sizing_in_plan ? 1e6 : 0) + (sizingScore(a) ?? -1e3)
         : a[sortKey];
       let bv = sortKey === SCENARIO_ETF_20D_FLAT_SORT_KEY
         ? computeScenarioEtf20dFlatUnd(b, chartVolLookbackRange)
@@ -12996,6 +13213,10 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
         ? volHeadlineValue(b, 'underlying', chartVolLookbackRange)
         : sortKey === 'vol_etf_annual'
         ? volHeadlineValue(b, 'etf', chartVolLookbackRange)
+        : sortKey === 'net_carry_annual'
+        ? sizingScore(b)
+        : sortKey === 'sizing_state'
+        ? (b.sizing_in_plan ? 1e6 : 0) + (sizingScore(b) ?? -1e3)
         : b[sortKey];
       if (av == null) av = sortDesc ? -Infinity : Infinity;
       if (bv == null) bv = sortDesc ? -Infinity : Infinity;
@@ -13172,20 +13393,17 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
               sub={summary.top_realized_net_vs_avg_borrow?.[0]?.symbol || ''}
               color="var(--positive)"
             />
-            <SummaryCard
-              label="Top net edge (p50)"
-              value={summary.top_net_edge?.[0] ? fmtLogYr(summary.top_net_edge[0].net_edge_p50_annual) : '—'}
-              sub={
-                summary.top_net_edge?.[0]?.symbol
-                  ? `${summary.top_net_edge[0].symbol}${
-                      summary.top_net_edge_suppressed
-                        ? ` · ${summary.top_net_edge_suppressed} suppressed`
-                        : ''
-                    }`
-                  : ''
-              }
-              color="var(--positive)"
-            />
+            {(() => {
+              const top = topSizingScores(records, 1)[0];
+              return (
+                <SummaryCard
+                  label="Top net carry (sizing score)"
+                  value={top ? fmtNetCarry(sizingScore(top)) : '—'}
+                  sub={top ? `${top.symbol}${top.sizing_in_plan ? ' · in plan' : ''}` : ''}
+                  color="var(--positive)"
+                />
+              );
+            })()}
             {/* Borrow coverage, not just "did the fetch return": a partial Olympus
                 result falls back silently, and with borrow unknown net edge
                 collapses to gross decay — identical for every name in a sleeve.
@@ -13225,29 +13443,18 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
               </ul>
             </div>
             <div className="summary-card">
-              <div className="label">Top 5 net edge (p50)</div>
+              <div className="label">Top 5 net carry (sizing score)</div>
               <ul className="highlight-list">
-                {(summary.top_net_edge || []).map(s => (
-                  <li key={s.symbol}>
-                    <span className="sym">{s.symbol}</span>
-                    <span className="val-positive">{fmtLogYr(s.net_edge_p50_annual)}</span>
+                {topSizingScores(records, 5).map(s => (
+                  <li key={s.symbol} title={sizingScoreTooltip(s)}>
+                    <span className="sym">{s.symbol}{s.sizing_in_plan ? '' : ' · not in plan'}</span>
+                    <span className="val-positive">{fmtNetCarry(sizingScore(s))}</span>
                   </li>
                 ))}
               </ul>
-              {summary.top_net_edge_suppressed ? (
-                <div
-                  style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.4 }}
-                  title={
-                    'Levered/inverse names whose annualised drag is dominated by the underlying’s '
-                    + 'σ² term (½·|δ|·|δ−1|·σ²). Ranking on those sorts the book by variance, '
-                    + 'not by edge, so they are excluded here and badged σ² in the table.'
-                  }
-                >
-                  {summary.top_net_edge_suppressed} name
-                  {summary.top_net_edge_suppressed === 1 ? '' : 's'} suppressed — annualisation not
-                  meaningful (σ²-dominated)
-                </div>
-              ) : null}
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.4 }}>
+                Net carry for buckets 1 and 2, harvest edge for bucket 3: the score each sleeve is weighted on.
+              </div>
             </div>
           </div>
 
@@ -13391,6 +13598,7 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
           </details>
 
           {/* ── Table ─────────── */}
+          <SizingPolicyStrip policy={data.sizing_policy} />
           <div className="table-container">
             <table className="etf-table">
               <thead>
@@ -13443,25 +13651,39 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
                             dashboardBuildTime={data.build_time}
                           />
                         </td>
-                        <td>{fmtSharesAvail(r.shares_available)}</td>
+                        <td style={{ color: 'var(--text-muted)' }} title="IBKR proxy, display only. Not a size input: capacity is Clear Street's locate decision.">{fmtSharesAvail(r.shares_available)}</td>
                         <td title="Realized trailing hedge drag (ls-algo screener)">{fmtGrossRealizedLog(r, r.gross_decay_annual)}</td>
                         <td title={decayDistTooltip(r, chartVolLookbackRange)}>
                           {renderExpectedDecayCell(r, chartVolLookbackRange)}
+                        </td>
+                        <td
+                          className={grossShortFavCls(Number(sizingScore(r)))}
+                          title={sizingScoreTooltip(r)}
+                          style={{ fontWeight: 600 }}
+                        >
+                          {fmtNetCarry(sizingScore(r))}
+                          {isHarvestSized(r) ? (
+                            <span style={{ fontSize: 9, fontWeight: 400, color: 'var(--text-muted)', marginLeft: 4 }}>harvest</span>
+                          ) : null}
+                        </td>
+                        <td style={{ verticalAlign: 'middle' }}>
+                          <SizingCell r={r} />
                         </td>
                         <td style={{ verticalAlign: 'middle' }}>
                           {isPassiveLowDeltaRow(r) ? (
                             <span title={PASSIVE_LOW_DELTA_POLICY_TOOLTIP} style={{ color: 'var(--text-muted)' }}>
                               —
                             </span>
+                          ) : isHarvestSized(r) ? (
+                            <span style={{ color: 'var(--text-muted)', fontSize: 11 }} title="Bucket 3 sizes on the harvest edge. The model edge is not its admission test.">
+                              n/a {'·'} VR {r.b3_vr14 != null ? Number(r.b3_vr14).toFixed(2) : '—'}
+                            </span>
                           ) : (
-                            <NetEdgeMergedCell r={r} />
+                            <>
+                              <NetEdgeMergedCell r={r} />
+                              <ModelEdgeBar r={r} />
+                            </>
                           )}
-                        </td>
-                        <td
-                          className={grossShortFavCls(Number(r?.net_carry_annual))}
-                          title={netCarryTooltip(r)}
-                        >
-                          {fmtNetCarry(r?.net_carry_annual)}
                         </td>
                         <td
                           className={grossShortFavCls(Number(r?.realized_pair_gross_20d))}
