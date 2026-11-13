@@ -886,6 +886,106 @@ function SizingPolicyStrip({ policy }) {
     </div>
   );
 }
+// ── How each bucket is sized ────────────────────────────────────────────────
+// `sizing_policy.sleeves` is the plan's own per-sleeve record, in ratios only:
+// each sleeve's budget is its target share of capital x gross leverage, and
+// the steps say what fraction of that budget each plan stage left. The targets
+// above are budgets the caps never fill, so this is where the gap goes.
+const SLEEVE_NAMES = { bucket_1: 'B1 core leveraged', bucket_2: 'B2 YieldBOOST', bucket_3: 'B3 inverse' };
+const SLEEVE_BINDING = {
+  weight: 'weight', locate: 'locate supply', liquidity: 'liquidity cap',
+  tail: 'tail budget', unlabelled: 'no label', 'cut out': 'cut to zero',
+};
+const SLEEVE_STEP_NOTE = {
+  budget: 'Target share x capital x gross leverage.',
+  solve: "Gross the sleeve's solver deployed before any cap.",
+  b3_tail: "Bucket 3's crash-loss budget per underlier.",
+  b3_rest: 'Rest of the bucket-3 solve: cadence gate and net-delta budget.',
+  caps: 'Per-pair, locate and liquidity caps and the covariance stage, net of the rescale between the two caps passes.',
+  smoother: 'Weight smoother toward the last published plan.',
+  deadband: 'No-trade band around the held size.',
+  final: 'What the plan ships: after the wrapper split and the per-pair liquidity cap.',
+};
+const SLEEVE_KIND = { drop: 'dropped', excluded: 'excluded', freeze: 'frozen at held size' };
+function SleeveSizingCard({ id, s, targetShare, scoreCol }) {
+  const pct = (v, dp = 0) => (v == null || !Number.isFinite(Number(v)) ? '—' : (Number(v) * 100).toFixed(dp) + '%');
+  const pts = (v) => (v == null || !Number.isFinite(Number(v)) ? '' : (Number(v) >= 0 ? '+' : '−') + Math.abs(Number(v) * 100).toFixed(0) + ' pts');
+  const all = s.steps || [];
+  const steps = all.filter((st, i) => i === 0 || i === all.length - 1 || Math.abs(Number(st.change_frac_of_budget) || 0) >= 0.005);
+  const score = s.score || {};
+  const label = (k) => (k === 'final' ? 'Plan' : null);
+  const muted = { color: 'var(--text-muted)' };
+  return (
+    <div style={{ border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg-card)', padding: '8px 10px', minWidth: 0 }}>
+      <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: 12 }}>{SLEEVE_NAMES[id] || id}</div>
+      <div style={{ fontSize: 11, ...muted, margin: '2px 0 6px' }}>
+        Fills <strong style={{ color: 'var(--text-primary)' }}>{pct(s.fill_of_budget)}</strong> of its budget ({pct(targetShare, 1)} target)
+        {' · '}{pct(s.share_of_book, 1)} of the book{' · '}{s.n_in_plan ?? '—'} names
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+        {steps.map((st) => {
+          const end = st.key === 'budget' || st.key === 'final';
+          const w = Math.max(0, Math.min(100, (Number(st.frac_of_budget) || 0) * 100));
+          const by = (st.by_binding || []).map((m) => `${SLEEVE_BINDING[m.word] || m.word} ${pts(m.change_frac_of_budget)}`).join(' · ');
+          const tip = [SLEEVE_STEP_NOTE[st.key], by ? `Split by what holds each name now: ${by}` : null].filter(Boolean).join(' ');
+          return (
+            <div key={st.key} title={tip}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(96px, 1.2fr) 1fr 88px', gap: 6, alignItems: 'center', fontSize: 11 }}>
+                <span style={{ color: end ? 'var(--text-primary)' : 'var(--text-secondary)', fontWeight: end ? 600 : 400, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {label(st.key) || st.label}
+                </span>
+                <span style={{ height: 8, borderRadius: 2, background: 'var(--bg-input)', position: 'relative' }}>
+                  <span style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: `${w.toFixed(1)}%`, borderRadius: 2, background: end ? 'var(--accent-blue)' : 'var(--text-muted)' }} />
+                </span>
+                <span style={{ textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                  {pct(st.frac_of_budget)}
+                  {st.key !== 'budget' && st.change_frac_of_budget ? (
+                    <span style={{ marginLeft: 6, color: Number(st.change_frac_of_budget) < 0 ? 'var(--negative)' : 'var(--positive)' }}>{pts(st.change_frac_of_budget)}</span>
+                  ) : null}
+                </span>
+              </div>
+              {by ? <div style={{ fontSize: 10, ...muted, paddingLeft: 10 }}>{by}</div> : null}
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ fontSize: 11, marginTop: 6, ...muted }}>
+        <strong style={{ color: 'var(--text-secondary)' }}>Weighted on</strong> {score.label || scoreCol || '—'}
+        {score.gross_weighted != null ? ` · ${pct(score.gross_weighted, 1)} gross-weighted, ${pct(score.median, 1)} median` : ''}
+      </div>
+      <div style={{ fontSize: 11, ...muted }}>
+        <strong style={{ color: 'var(--text-secondary)' }}>Held at size by</strong>{' '}
+        {(s.binding || []).map((b) => `${SLEEVE_BINDING[b.word] || b.word} ${b.n} (${pct(b.share)})`).join(' · ') || '—'}
+      </div>
+      {(s.admission || []).length ? (
+        <div style={{ fontSize: 11, ...muted }}>
+          <strong style={{ color: 'var(--text-secondary)' }}>Kept out today</strong>{' '}
+          {s.admission.map((a) => `${a.label}: ${a.n} ${SLEEVE_KIND[a.kind] || a.kind}`).join(' · ')}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+function SleeveSizingPanel({ policy }) {
+  const sl = policy?.sleeves;
+  if (!sl || !sl.buckets) return null;
+  const ids = ['bucket_1', 'bucket_2', 'bucket_3'].filter((b) => sl.buckets[b]);
+  if (!ids.length) return null;
+  const t = policy.sleeve_targets || {};
+  const w = policy.weight_score || {};
+  return (
+    <details open style={{ margin: '0 2px 12px' }}>
+      <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-secondary)' }}>
+        <strong style={{ color: 'var(--text-primary)' }}>How each bucket is sized</strong>
+        {' — '}plan of {sl.plan_date || '—'}: the book fills {sl.fill_of_budget != null ? (Number(sl.fill_of_budget) * 100).toFixed(0) + '%' : '—'} of its gross budget.
+        The targets are budgets; the bars show what each plan stage left of them.
+      </summary>
+      <div style={{ display: 'grid', gap: 10, gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))', marginTop: 8 }}>
+        {ids.map((b) => <SleeveSizingCard key={b} id={b} s={sl.buckets[b]} targetShare={t[b] ?? sl.buckets[b].target_weight} scoreCol={w[b]} />)}
+      </div>
+    </details>
+  );
+}
 const fmtPct = v => {
   if (v == null || !Number.isFinite(Number(v))) return '—';
   const n = Number(v) * 100;
@@ -13599,6 +13699,7 @@ function App({ authUser = null, onLogout = null, authEnabled = false } = {}) {
 
           {/* ── Table ─────────── */}
           <SizingPolicyStrip policy={data.sizing_policy} />
+          <SleeveSizingPanel policy={data.sizing_policy} />
           <div className="table-container">
             <table className="etf-table">
               <thead>
